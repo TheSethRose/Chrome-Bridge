@@ -15,6 +15,7 @@ const manifest = JSON.parse(await read("extension/manifest.json"));
 const background = await read("extension/background.js");
 const skill = await read("skill/chrome-bridge/SKILL.md");
 const skillCommands = await read("skill/chrome-bridge/references/commands.md");
+const skillData = await read("skill/chrome-bridge/references/data-and-state.md");
 const skillWorkflows = await read("skill/chrome-bridge/references/workflows.md");
 const cliSource = await read("bin/chrome-bridge.mjs");
 const sidepanelHtml = await read("extension/sidepanel.html");
@@ -39,6 +40,11 @@ assert.match(background, /responseChunk/);
 assert.match(background, /bridge-status-update/);
 assert.match(background, /bridge-clear-logs/);
 assert.match(background, /auditLog\.slice\(-25\)/);
+const statusScheduler = background.match(/function scheduleStatusBroadcast\(\) \{[\s\S]*?\n\}/)?.[0] || "";
+assert.doesNotMatch(statusScheduler, /clearTimeout\(statusBroadcastTimer\)/, "busy network events must not starve status broadcasts");
+assert.match(statusScheduler, /statusBroadcastQueued/, "status broadcasts need a trailing update after throttling");
+assert.match(background, /const activeCommands = new Map\(\)/);
+assert.match(background, /activity\.networkRequests \+= 1/);
 assert.match(sidepanelScript, /chrome\.runtime\.onMessage/);
 assert.match(sidepanelScript, /document\.createElement\("details"\)/);
 assert.match(sidepanelScript, /navigator\.clipboard\.writeText/);
@@ -48,12 +54,32 @@ assert.match(sidepanelScript, /COLLECTION_PAGE = 50/);
 assert.match(sidepanelScript, /command-disclosure\[open\]/);
 assert.doesNotMatch(sidepanelScript, /document\.createElement\("pre"\)/, "large log payloads must not render as a single preformatted block");
 assert.match(sidepanelHtml, /id="clear-logs"/);
+for (const id of ["running", "attachments", "requests", "captures", "activity-summary"]) {
+  assert.match(sidepanelHtml, new RegExp(`id="${id}"`), `missing live activity field ${id}`);
+}
+assert.match(sidepanelScript, /status\.activeCommands/);
+assert.match(sidepanelScript, /stats\.networkRequests/);
 assert.doesNotMatch(sidepanelHtml, /<script(?![^>]*\bsrc=)/i, "side panel must not contain inline scripts");
 assert.match(skill, /^---\nname: chrome-bridge\ndescription:/);
 assert.match(skill, /references\/commands\.md/);
+assert.match(skill, /references\/data-and-state\.md/);
 assert.match(skill, /references\/workflows\.md/);
-for (const documented of ["network capture", "upload-file", "emulate", "cdp session-start", "chrome call"]) {
-  assert.match(skillCommands, new RegExp(documented.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `missing command reference for ${documented}`);
+assert.match(skillCommands, /Use it for/);
+assert.match(skillCommands, /What it returns or changes/);
+for (const documented of [
+  "status", "list-tabs", "new-tab", "close-tab", "activate-tab", "navigate", "reload", "go-back", "go-forward", "detach", "audit",
+  "snapshot", "dom", "dom snapshot", "visible-text", "styles", "screenshot", "screencast", "eval",
+  "click", "hover", "drag", "type", "type-text", "press-key", "fill-form", "upload-file", "wait-for", "handle-dialog",
+  "network capture", "network start", "network tail", "network get-body", "network stop", "network export-har", "console capture",
+  "scripts list", "scripts get", "resources tree", "resources get", "page mhtml", "cookies", "storage", "targets",
+  "performance metrics", "performance profile", "performance trace", "resize", "emulate",
+  "history search", "bookmarks tree", "bookmarks search", "downloads search", "extensions list", "extension reload", "chrome call",
+  "cdp send", "cdp events", "cdp session-start", "cdp session-stop",
+]) {
+  assert.ok(skillCommands.includes("`" + documented), `missing command reference for ${documented}`);
+}
+for (const section of ["Where data lives", "How to find each kind of browser data", "Identifier model", "Network data lifecycle", "Large results and Native Messaging", "State lifetime and cleanup"]) {
+  assert.match(skillData, new RegExp(section), `missing data guide section ${section}`);
 }
 for (const workflow of ["Discover a private API", "persistent CDP session", "Develop another unpacked extension", "Recover from an interrupted task"]) {
   assert.match(skillWorkflows, new RegExp(workflow), `missing workflow reference for ${workflow}`);

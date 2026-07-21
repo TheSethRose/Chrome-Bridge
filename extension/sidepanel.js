@@ -1,7 +1,10 @@
 const connection = document.querySelector("#connection");
+const running = document.querySelector("#running");
 const attachments = document.querySelector("#attachments");
+const requests = document.querySelector("#requests");
 const captures = document.querySelector("#captures");
 const captureList = document.querySelector("#capture-list");
+const activitySummary = document.querySelector("#activity-summary");
 const commands = document.querySelector("#commands");
 const updated = document.querySelector("#updated");
 const clearLogs = document.querySelector("#clear-logs");
@@ -300,24 +303,56 @@ function renderCommands(entries) {
 
 function render(status) {
   const online = status.bridgeOnline && status.nativeConnected;
+  const activeCommands = status.activeCommands || [];
+  const activeCaptures = status.activeCaptures || [];
+  const stats = status.activity || {};
   connection.textContent = online ? "Connected" : "Disconnected";
   connection.className = `status ${online ? "online" : "offline"}`;
-  attachments.textContent = String(status.attachedTabs.length);
-  captures.textContent = String(status.activeCaptures.length);
+  running.textContent = String(activeCommands.length);
+  attachments.textContent = String((status.attachedTabs || []).length);
+  requests.textContent = Number(stats.networkRequests || 0).toLocaleString();
+  captures.textContent = String(activeCaptures.length);
+  activitySummary.textContent = `${Number(stats.commandsCompleted || 0).toLocaleString()} completed · ${Number(stats.commandsFailed || 0).toLocaleString()} failed · ${formatBytes(stats.networkBytes || 0)} captured · ${Number(stats.webSocketFrames || 0).toLocaleString()} WebSocket frames`;
 
-  replaceChildren(captureList, status.activeCaptures.map((capture) => {
+  const liveItems = activeCommands.map((command) => {
     const item = document.createElement("div");
     const title = document.createElement("strong");
     const details = document.createElement("span");
-    title.textContent = capture.tabTitle || "Active tab";
+    const tabTitle = command.tabTitle || (command.tabId ? `Tab ${command.tabId}` : command.targetId ? `Target ${command.targetId}` : "Browser");
+    title.textContent = `${command.command} · ${tabTitle}`;
+    title.title = title.textContent;
+    details.textContent = `Running · started ${new Date(command.startedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}`;
+    item.append(title, details);
+    return item;
+  });
+  liveItems.push(...activeCaptures.map((capture) => {
+    const item = document.createElement("div");
+    const title = document.createElement("strong");
+    const details = document.createElement("span");
+    title.textContent = `Network · ${capture.tabTitle || "Active tab"}`;
     title.title = capture.tabTitle || "";
-    details.textContent = `${capture.requests} requests · ${capture.webSocketFrames} WebSocket frames`;
+    details.textContent = `${capture.requests.toLocaleString()} requests · ${capture.webSocketFrames.toLocaleString()} WebSocket frames`;
     item.append(title, details);
     return item;
   }));
+  if (!liveItems.length) {
+    const empty = document.createElement("p");
+    empty.className = "live-empty";
+    empty.textContent = "No command or capture is running. Start a network capture to watch requests here.";
+    liveItems.push(empty);
+  }
+  replaceChildren(captureList, liveItems);
 
   renderCommands(status.recentCommands);
   updated.textContent = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
+}
+
+function formatBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1_000) return `${bytes} B`;
+  if (bytes < 1_000_000) return `${(bytes / 1_000).toFixed(1)} KB`;
+  if (bytes < 1_000_000_000) return `${(bytes / 1_000_000).toFixed(1)} MB`;
+  return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
 }
 
 async function refresh() {

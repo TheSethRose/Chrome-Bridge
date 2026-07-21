@@ -19,10 +19,13 @@
       <section aria-labelledby="activity-title">
         <h2 id="activity-title">Live activity</h2>
         <dl class="metrics">
+          <div><dt>Running commands</dt><dd id="running">0</dd></div>
           <div><dt>Debugger tabs</dt><dd id="attachments">0</dd></div>
-          <div><dt>Network captures</dt><dd id="captures">0</dd></div>
+          <div><dt>Requests captured</dt><dd id="requests">0</dd></div>
+          <div><dt>Active captures</dt><dd id="captures">0</dd></div>
         </dl>
-        <div id="capture-list" class="capture-list"></div>
+        <p id="activity-summary" class="activity-summary">No activity since the extension loaded.</p>
+        <div id="capture-list" class="capture-list" aria-live="polite"></div>
       </section>
 
       <section aria-labelledby="commands-title">

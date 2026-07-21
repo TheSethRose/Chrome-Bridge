@@ -4,7 +4,20 @@ const PROTOCOL_VERSION = "1.3";
 let nativePort;
 let hostOnline = false;
 let statusBroadcastTimer;
+let statusBroadcastQueued = false;
 const attachedOwners = new Map();
+const activeCommands = new Map();
+const activity = {
+  commandsStarted: 0,
+  commandsCompleted: 0,
+  commandsFailed: 0,
+  debuggerAttaches: 0,
+  networkRequests: 0,
+  networkBytes: 0,
+  webSocketFrames: 0,
+  lastCommandAt: null,
+  lastNetworkAt: null,
+};
 const networkCaptures = new Map();
 const networkCaptureByTab = new Map();
 const consoleCaptures = new Map();
@@ -49,6 +62,8 @@ async function attach(tabId, owner) {
   if (target) throw new Error(`Tab ${tabId} is already attached to DevTools or another debugger client`);
   await chrome.debugger.attach({ tabId }, PROTOCOL_VERSION);
   attachedOwners.set(tabId, new Set([owner]));
+  activity.debuggerAttaches += 1;
+  scheduleStatusBroadcast();
 }
 
 async function detach(tabId, owner) {
@@ -58,6 +73,7 @@ async function detach(tabId, owner) {
   if (owners.size) return;
   attachedOwners.delete(tabId);
   await chrome.debugger.detach({ tabId }).catch(() => {});
+  scheduleStatusBroadcast();
 }
 
 async function detachAll(tabId) {
@@ -158,11 +174,27 @@ async function handleNativeMessage(message) {
 }
 
 async function executeAndRespond(id, command, params) {
+  const startedAt = Date.now();
+  activeCommands.set(id, {
+    id,
+    command,
+    tabId: params.tab === undefined ? undefined : Number(params.tab),
+    targetId: params.target,
+    startedAt,
+  });
+  activity.commandsStarted += 1;
+  activity.lastCommandAt = startedAt;
+  scheduleStatusBroadcast();
   try {
     const result = await executeCommand(command, params, id);
+    activity.commandsCompleted += 1;
     sendChunkedResponse(id, { ok: true, result, completedAt: Date.now() });
   } catch (error) {
+    activity.commandsFailed += 1;
     sendChunkedResponse(id, { ok: false, error: errorMessage(error), completedAt: Date.now() });
+  } finally {
+    activeCommands.delete(id);
+    scheduleStatusBroadcast();
   }
 }
 
@@ -177,11 +209,9 @@ function sendChunkedResponse(id, response) {
 }
 
 async function statusSnapshot() {
-  const { auditLog = [] } = await chrome.storage.local.get("auditLog");
-  return {
-    bridgeOnline: hostOnline,
-    nativeConnected: Boolean(nativePort),
+  const live = {
     attachedTabs: [...attachedOwners.keys()],
+    activeCommands: [...activeCommands.values()],
     activeCaptures: [...networkCaptures.values()].map((capture) => ({
       session: capture.id,
       tabId: capture.tabId,
@@ -196,15 +226,30 @@ async function statusSnapshot() {
       startedAt: new Date(session.startedAt).toISOString(),
     })),
     emulatedTabs: [...emulationOwners.keys()],
+    activity: { ...activity },
+  };
+  const { auditLog = [] } = await chrome.storage.local.get("auditLog");
+  return {
+    bridgeOnline: hostOnline,
+    nativeConnected: Boolean(nativePort),
+    ...live,
     recentCommands: auditLog.slice(-25).reverse(),
   };
 }
 
 function scheduleStatusBroadcast() {
-  clearTimeout(statusBroadcastTimer);
-  statusBroadcastTimer = setTimeout(async () => {
-    const status = await statusSnapshot().catch(() => null);
-    if (status) chrome.runtime.sendMessage({ type: "bridge-status-update", status }).catch(() => {});
+  if (statusBroadcastTimer) {
+    statusBroadcastQueued = true;
+    return;
+  }
+  statusSnapshot().then((status) => {
+    chrome.runtime.sendMessage({ type: "bridge-status-update", status }).catch(() => {});
+  }).catch(() => {});
+  statusBroadcastTimer = setTimeout(() => {
+    statusBroadcastTimer = undefined;
+    if (!statusBroadcastQueued) return;
+    statusBroadcastQueued = false;
+    scheduleStatusBroadcast();
   }, 50);
 }
 
@@ -279,6 +324,12 @@ async function executeCommand(command, params, requestId) {
       || (["cdp-send", "cdp-events"].includes(command) && (params.target || params.bridgeSession))
       || (command === "cdp-session-start" && params.target);
     tab = targetOnlyCommand ? undefined : await resolveTab(params.tab);
+    const active = activeCommands.get(requestId);
+    if (active && tab) {
+      active.tabId = tab.id;
+      active.tabTitle = tab.title || tab.url || "Untitled tab";
+      scheduleStatusBroadcast();
+    }
     const owner = `command:${requestId}`;
     let result;
 
@@ -1375,6 +1426,9 @@ function handleNetworkEvent(capture, source, method, params) {
         headers: params.redirectResponse.headers,
       } : undefined,
     });
+    activity.networkRequests += 1;
+    activity.lastNetworkAt = Date.now();
+    scheduleStatusBroadcast();
     return;
   }
 
@@ -1400,6 +1454,9 @@ function handleNetworkEvent(capture, source, method, params) {
     record.encodedDataLength = params.encodedDataLength;
     record.finishedTimestamp = params.timestamp;
     record.durationMs = record.timestamp ? Math.max(0, (params.timestamp - record.timestamp) * 1000) : undefined;
+    activity.networkBytes += Number(params.encodedDataLength) || 0;
+    activity.lastNetworkAt = Date.now();
+    scheduleStatusBroadcast();
     if (capture.includeBodies) {
       const pending = getResponseBody(capture, record).then((body) => {
         record.body = body;
@@ -1428,6 +1485,9 @@ function handleNetworkEvent(capture, source, method, params) {
       mask: params.response?.mask,
       payload: params.response?.payloadData || "",
     });
+    activity.webSocketFrames += 1;
+    activity.lastNetworkAt = Date.now();
+    scheduleStatusBroadcast();
   }
 }
 

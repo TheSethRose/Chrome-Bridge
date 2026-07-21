@@ -1,6 +1,6 @@
 # Workflow recipes
 
-Use these combinations when one command is insufficient. Replace IDs and selectors with values discovered from the live page.
+Use these combinations when one command is insufficient. Replace IDs and selectors with values discovered from the live page. Read [commands.md](commands.md) for each command's purpose and result, and [data-and-state.md](data-and-state.md) when the recipe produces IDs, captures, retained logs, or large files.
 
 ## Inspect, act, and verify
 
