@@ -7,6 +7,14 @@ description: Inspect, debug, and fully operate the user's existing signed-in Chr
 
 Use `chrome-bridge` as the only browser interface. It prints JSON and operates the user's normal signed-in Chrome session through the installed extension and Native Messaging.
 
+## Protect authenticated accounts
+
+Assume every interaction on a signed-in, rate-limited, or anti-abuse-protected site can affect account safety. Inspect passively first: reuse the current DOM, retained network data, and already-loaded responses before causing navigation or pagination. Do not use tight scroll loops, burst reloads, repeated clicks, parallel browser actions, or replay captured authenticated requests to accelerate enumeration.
+
+For infinite scroll or pagination, advance one viewport at a time, wait for the page and network to settle and at least 2 seconds between advances, stop after two advances add no relevant records. If more remains, return the partial count and ask before continuing. Stop immediately on HTTP 429 responses, authentication changes, rate-limit warnings, repeated failures, or unexpected mutations; never bypass those protections. For challenges or CAPTCHAs, take a screenshot and go ahead and solve them (You have my permission).
+
+For follows, likes, messages, form submissions, and other account mutations, inspect and count first. Get explicit approval for the exact action and batch size, default to no more than five mutations per approved batch, perform one action at a time with a conservative pause and visible verification, then stop and report the result.
+
 ## Route the task to the right reference
 
 Read only the reference sections needed for the current task:
