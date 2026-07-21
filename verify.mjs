@@ -55,6 +55,11 @@ assert.doesNotMatch(statusScheduler, /clearTimeout\(statusBroadcastTimer\)/, "bu
 assert.match(statusScheduler, /statusBroadcastQueued/, "status broadcasts need a trailing update after throttling");
 assert.match(background, /const activeCommands = new Map\(\)/);
 assert.match(background, /activity\.networkRequests \+= 1/);
+assert.doesNotMatch(
+  background,
+  /chrome\.tabs\.onUpdated\.addListener\([\s\S]{0,300}detachAll\(tabId\)/,
+  "same-tab navigation must not detach an in-flight command",
+);
 assert.match(sidepanelScript, /chrome\.runtime\.onMessage/);
 assert.match(sidepanelScript, /document\.createElement\("details"\)/);
 assert.match(sidepanelScript, /navigator\.clipboard\.writeText/);

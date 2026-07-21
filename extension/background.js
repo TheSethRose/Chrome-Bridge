@@ -296,6 +296,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (sender.id !== chrome.runtime.id) return false;
   const action = message?.type === "bridge-clear-logs"
     ? chrome.storage.local.remove("auditLog").then(() => {
+        activity.networkRequests = 0;
         nativePort?.postMessage({ type: "clearLogs", id: crypto.randomUUID() });
         return statusSnapshot();
       })
@@ -1566,9 +1567,4 @@ chrome.debugger.onDetach.addListener((source) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   detachAll(tabId).catch(() => {});
-});
-
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (!changeInfo.url) return;
-  if (!networkCaptureByTab.has(tabId)) detachAll(tabId).catch(() => {});
 });
