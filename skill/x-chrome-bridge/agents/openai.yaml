@@ -1,4 +1,4 @@
 interface:
   display_name: "X via Chrome Bridge"
-  short_description: "Safely inspect and operate X in live Chrome"
-  default_prompt: "Use $x-chrome-bridge to inspect or operate X safely in my signed-in Chrome session."
+  short_description: "Retrieve X data and operate the signed-in account"
+  default_prompt: "Use $x-chrome-bridge to retrieve my X data or operate my signed-in account for this task."
