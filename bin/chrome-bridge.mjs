@@ -88,8 +88,12 @@ async function setup() {
   const binDirectory = path.join(os.homedir(), ".local", "bin");
   const skillDirectory = path.join(os.homedir(), ".agents", "skills");
   await Promise.all([mkdir(binDirectory, { recursive: true }), mkdir(skillDirectory, { recursive: true })]);
-  await replaceSymlink(path.join(binDirectory, "chrome-bridge"), SCRIPT);
-  await replaceSymlink(path.join(skillDirectory, "chrome-bridge"), path.join(ROOT, "skill", "chrome-bridge"));
+  await Promise.all([
+    replaceSymlink(path.join(binDirectory, "chrome-bridge"), SCRIPT),
+    replaceSymlink(path.join(skillDirectory, "chrome-bridge"), path.join(ROOT, "skill", "chrome-bridge")),
+    replaceSymlink(path.join(skillDirectory, "x-chrome-bridge"), path.join(ROOT, "skill", "x-chrome-bridge")),
+    replaceSymlink(path.join(skillDirectory, "linkedin-chrome-bridge"), path.join(ROOT, "skill", "linkedin-chrome-bridge")),
+  ]);
 
   return {
     installed: true,
@@ -98,6 +102,8 @@ async function setup() {
     nativeManifest: nativeManifestPath,
     cli: path.join(binDirectory, "chrome-bridge"),
     skill: path.join(skillDirectory, "chrome-bridge"),
+    bonusSkill: path.join(skillDirectory, "x-chrome-bridge"),
+    linkedinSkill: path.join(skillDirectory, "linkedin-chrome-bridge"),
     pathHint: process.env.PATH?.split(path.delimiter).includes(binDirectory) ? null : `export PATH="${binDirectory}:$PATH"`,
   };
 }

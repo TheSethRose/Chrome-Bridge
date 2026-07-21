@@ -11,7 +11,7 @@ npm run setup
 
 Then load `~/Developer/experiments/chrome-bridge/extension` through `chrome://extensions` using **Developer mode** and **Load unpacked**. The extension connects automatically and the CLI can immediately access normal tabs. Click its toolbar icon to open the live status panel; it reports the native connection, debugger attachments, network captures, request counts, and the latest 25 CLI commands without controlling access. Expand a command to inspect its request and response as nested key/value rows, or use its copy button to copy both as formatted JSON. Large strings and collections are paged in the panel while the complete payload remains available on disk and through copy.
 
-Setup registers the native host, links `chrome-bridge` into `~/.local/bin`, and links the bundled skill into `~/.agents/skills/chrome-bridge`. If `~/.local/bin` is not already on `PATH`, setup prints the one line to add.
+Setup registers the native host, links `chrome-bridge` into `~/.local/bin`, and links the bundled `chrome-bridge`, `x-chrome-bridge`, and `linkedin-chrome-bridge` skills into `~/.agents/skills`. If `~/.local/bin` is not already on `PATH`, setup prints the one line to add.
 
 ## Examples
 

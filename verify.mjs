@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile as execFileCallback, spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readlink, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -17,6 +17,10 @@ const skill = await read("skill/chrome-bridge/SKILL.md");
 const skillCommands = await read("skill/chrome-bridge/references/commands.md");
 const skillData = await read("skill/chrome-bridge/references/data-and-state.md");
 const skillWorkflows = await read("skill/chrome-bridge/references/workflows.md");
+const xSkill = await read("skill/x-chrome-bridge/SKILL.md");
+const xSkillMetadata = await read("skill/x-chrome-bridge/agents/openai.yaml");
+const linkedinSkill = await read("skill/linkedin-chrome-bridge/SKILL.md");
+const linkedinSkillMetadata = await read("skill/linkedin-chrome-bridge/agents/openai.yaml");
 const cliSource = await read("bin/chrome-bridge.mjs");
 const sidepanelHtml = await read("extension/sidepanel.html");
 const sidepanelScript = await read("extension/sidepanel.js");
@@ -80,6 +84,20 @@ assert.match(skill, /^---\nname: chrome-bridge\ndescription:/);
 assert.match(skill, /references\/commands\.md/);
 assert.match(skill, /references\/data-and-state\.md/);
 assert.match(skill, /references\/workflows\.md/);
+assert.match(xSkill, /^---\nname: x-chrome-bridge\ndescription:/);
+assert.match(xSkill, /friendships\/create/);
+assert.match(xSkill, /x-rate-limit-remaining/);
+assert.match(xSkill, /Follows you/);
+assert.match(xSkillMetadata, /\$x-chrome-bridge/);
+assert.match(linkedinSkill, /^---\nname: linkedin-chrome-bridge\ndescription:/);
+assert.match(linkedinSkill, /main#workspace/);
+assert.match(linkedinSkill, /data-testid=mainFeed/);
+assert.match(linkedinSkill, /msg-conversations-container__conversations-list/);
+assert.match(linkedinSkill, /msg-s-message-list__event/);
+assert.match(linkedinSkill, /mypreferences\/d\/download-my-data/);
+assert.match(linkedinSkill, /preload\/sharebox/);
+assert.match(linkedinSkill, /flagship-web\/rsc-action\/actions/);
+assert.match(linkedinSkillMetadata, /\$linkedin-chrome-bridge/);
 assert.match(skillCommands, /Use it for/);
 assert.match(skillCommands, /What it returns or changes/);
 for (const documented of [
@@ -247,6 +265,9 @@ await waitFor(
   `setup-generated native host did not survive Chrome's PATH: ${installedError}`,
 );
 installedHost.kill();
+assert.match(await readlink(path.join(setupHome, ".agents", "skills", "chrome-bridge")), /skill\/chrome-bridge$/);
+assert.match(await readlink(path.join(setupHome, ".agents", "skills", "x-chrome-bridge")), /skill\/x-chrome-bridge$/);
+assert.match(await readlink(path.join(setupHome, ".agents", "skills", "linkedin-chrome-bridge")), /skill\/linkedin-chrome-bridge$/);
 await rm(setupHome, { recursive: true, force: true });
 
 console.log("Chrome Bridge contracts verified.");

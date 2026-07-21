@@ -1,0 +1,4 @@
+interface:
+  display_name: "LinkedIn via Chrome Bridge"
+  short_description: "Read data and run LinkedIn from Chrome"
+  default_prompt: "Use $linkedin-chrome-bridge to retrieve my LinkedIn data or operate my signed-in account for this task."

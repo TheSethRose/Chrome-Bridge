@@ -1,6 +1,6 @@
 ---
 name: chrome-bridge
-description: Inspect, debug, and fully operate the user's existing signed-in Chrome session through the local chrome-bridge JSON CLI, without MCP or a separate automation profile. Use for live DOM, accessibility, styles, scripts, resources, console, network bodies, WebSockets, storage, cookies, targets, screenshots, screencasts, performance, emulation, dialogs, file upload, real mouse and keyboard input, extension management, browser APIs, JavaScript evaluation, or stateful raw CDP while developing websites and Chrome extensions.
+description: Inspect, debug, and operate the user's signed-in Chrome session with the local chrome-bridge JSON CLI. Use for DOM/accessibility, screenshots/screencasts, mouse/keyboard/forms/files/dialogs, console/network/WebSockets, scripts/resources/targets, cookies/storage, performance/emulation, extension/browser APIs, JavaScript evaluation, or raw CDP in websites and Chrome extensions.
 ---
 
 # Chrome Bridge
@@ -37,7 +37,7 @@ Use the section links below to avoid loading an entire reference unnecessarily:
 
 ## Operating rules
 
-1. Run `chrome-bridge status` and `chrome-bridge list-tabs`, then select the intended tab explicitly with `--tab=ID`.
+1. Multiple agents can use Chrome Bridge concurrently through the same extension and signed-in session, including the same tab. Each agent should run `chrome-bridge status` and `chrome-bridge list-tabs`, use explicit `--tab=ID` targets so active-tab changes do not redirect commands, and coordinate overlapping state changes on the same tab.
 2. Inspect narrowly first. Prefer a targeted `eval` or semantic `snapshot` over returning the entire DOM, network log, or storage database.
 3. Write large results with `--file=/absolute/path`; read [large results](references/data-and-state.md#large-results-and-native-messaging) before assuming terminal clipping means data loss.
 4. Perform external or destructive actions only when requested. Submit exactly the approved content, then verify the resulting page state or request.
