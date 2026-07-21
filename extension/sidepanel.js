@@ -1,4 +1,5 @@
 const connection = document.querySelector("#connection");
+const reconnect = document.querySelector("#reconnect");
 const running = document.querySelector("#running");
 const attachments = document.querySelector("#attachments");
 const requests = document.querySelector("#requests");
@@ -6,8 +7,11 @@ const captures = document.querySelector("#captures");
 const captureList = document.querySelector("#capture-list");
 const activitySummary = document.querySelector("#activity-summary");
 const commands = document.querySelector("#commands");
-const updated = document.querySelector("#updated");
 const clearLogs = document.querySelector("#clear-logs");
+const commandSearch = document.querySelector("#command-search");
+const statusFilter = document.querySelector("#status-filter");
+const tabFilter = document.querySelector("#tab-filter");
+const logSummary = document.querySelector("#log-summary");
 const logPort = chrome.runtime.connect({ name: "bridge-log-viewer" });
 const logCache = new Map();
 const logLoads = new Map();
@@ -16,6 +20,8 @@ const expandedLogs = new Set();
 const STRING_PAGE = 1_500;
 const COLLECTION_PAGE = 50;
 let commandSignature = "";
+let tabSignature = "";
+let recentEntries = [];
 
 function replaceChildren(parent, children) {
   parent.replaceChildren(...children);
@@ -77,9 +83,12 @@ function icon(kind) {
   svg.setAttribute("viewBox", "0 0 24 24");
   svg.setAttribute("aria-hidden", "true");
   const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-  path.setAttribute("d", kind === "check"
-    ? "M20 6 9 17l-5-5"
-    : "M8 8h11v11H8zM5 16H4V5h11v1");
+  const paths = {
+    check: "M20 6 9 17l-5-5",
+    copy: "M8 8h11v11H8zM5 16H4V5h11v1",
+    error: "M12 8v5m0 4h.01M10.3 3.7 2.2 17.7a2 2 0 0 0 1.7 3h16.2a2 2 0 0 0 1.7-3L13.7 3.7a2 2 0 0 0-3.4 0Z",
+  };
+  path.setAttribute("d", paths[kind] || paths.copy);
   svg.append(path);
   return svg;
 }
@@ -121,6 +130,22 @@ function scalarValue(value) {
   return cell;
 }
 
+function readableTimestamp(key, value) {
+  if (!["at", "createdAt", "startedAt", "completedAt", "lastCommandAt", "lastNetworkAt"].includes(key)) return null;
+  if (value === null || value === undefined || value === "") return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    fractionalSecondDigits: 3,
+  });
+}
+
 function valueRow(key, value) {
   if (value && typeof value === "object") return collectionRow(key, value);
   const row = document.createElement("div");
@@ -128,7 +153,10 @@ function valueRow(key, value) {
   name.className = "kv-key";
   name.textContent = key;
   row.className = "kv-row";
-  row.append(name, scalarValue(value));
+  const formatted = readableTimestamp(key, value);
+  const cell = scalarValue(formatted || value);
+  if (formatted) cell.title = `Raw value: ${value}`;
+  row.append(name, cell);
   return row;
 }
 
@@ -196,8 +224,29 @@ function dataSection(label, part, data) {
   return section;
 }
 
-function renderLogData(container, data) {
+function timingSection(entry, data) {
+  const request = parsed(data.request);
+  const response = parsed(data.response);
+  const startedAt = entry.startedAt || request?.createdAt;
+  const completedAt = entry.completedAt || response?.completedAt;
+  const durationMs = entry.durationMs ?? (startedAt && completedAt ? completedAt - startedAt : undefined);
+  const section = document.createElement("section");
+  const title = document.createElement("h3");
+  const values = document.createElement("div");
+  title.textContent = "Timing";
+  values.className = "kv-list";
+  renderCollection(values, [
+    ["createdAt", startedAt ?? "Unavailable"],
+    ["completedAt", completedAt ?? "Unavailable"],
+    ["duration", durationMs === undefined ? "Unavailable" : `${durationMs.toLocaleString()} ms`],
+  ]);
+  section.append(title, values);
+  return section;
+}
+
+function renderLogData(container, data, entry) {
   replaceChildren(container, [
+    timingSection(entry, data),
     dataSection("Sent to Chrome", "request", data),
     dataSection("Received from Chrome", "response", data),
   ]);
@@ -217,11 +266,17 @@ async function copyLog(entry, button) {
     setTimeout(() => {
       button.replaceChildren(icon("copy"));
       button.classList.remove("copied");
-      button.setAttribute("aria-label", `Copy ${entry.command} request and response`);
+      button.setAttribute("aria-label", copyLabel(entry));
     }, 1_200);
   } finally {
     button.disabled = false;
   }
+}
+
+function copyLabel(entry) {
+  return entry.status === "error"
+    ? `Copy ${entry.command} error and command data`
+    : `Copy ${entry.command} request and response`;
 }
 
 function commandRow(entry) {
@@ -230,6 +285,7 @@ function commandRow(entry) {
   const summary = document.createElement("summary");
   const title = document.createElement("code");
   const tab = document.createElement("span");
+  const timing = document.createElement("span");
   const state = document.createElement("span");
   const copy = document.createElement("button");
   const body = document.createElement("div");
@@ -244,16 +300,26 @@ function commandRow(entry) {
   tab.textContent = tabTitle;
   tab.title = tabTitle;
   tab.className = "tab-name";
-  state.textContent = entry.status;
+  timing.textContent = entry.durationMs === undefined ? "" : formatDuration(entry.durationMs);
+  timing.className = "command-timing";
+  timing.title = entry.at ? `Completed ${formatClock(entry.at)}` : "";
+  state.textContent = entry.status === "error" ? "Error" : "Success";
   state.className = "command-state";
+  if (entry.status === "error") state.prepend(icon("error"));
   copy.type = "button";
   copy.className = "copy-log";
-  copy.setAttribute("aria-label", `Copy ${entry.command} request and response`);
+  copy.setAttribute("aria-label", copyLabel(entry));
   copy.append(icon("copy"));
   body.className = "log-detail";
-  summary.append(title, tab, state, copy);
+  summary.append(title, tab, timing, state);
+  if (entry.error) {
+    const errorSummary = document.createElement("span");
+    errorSummary.className = "command-error-summary";
+    errorSummary.append(icon("error"), document.createTextNode(entry.error));
+    summary.append(errorSummary);
+  }
   disclosure.append(summary, body);
-  item.append(disclosure);
+  item.append(disclosure, copy);
 
   const show = async () => {
     if (!entry.id) {
@@ -262,7 +328,7 @@ function commandRow(entry) {
     }
     body.classList.add("loading");
     body.textContent = "Loading complete request and response…";
-    try { renderLogData(body, await loadLog(entry.id)); }
+    try { renderLogData(body, await loadLog(entry.id), entry); }
     catch (error) { body.textContent = error.message; }
     finally { body.classList.remove("loading"); }
   };
@@ -277,9 +343,7 @@ function commandRow(entry) {
       expandedLogs.delete(entryKey);
     }
   });
-  copy.addEventListener("click", (event) => {
-    event.preventDefault();
-    event.stopPropagation();
+  copy.addEventListener("click", () => {
     if (entry.id) copyLog(entry, copy).catch(() => {});
   });
   if (!entry.id) copy.disabled = true;
@@ -287,32 +351,92 @@ function commandRow(entry) {
   return item;
 }
 
+function tabKey(entry) {
+  return entry.tabId === undefined ? `browser:${entry.tabTitle || entry.origin || "Browser"}` : `tab:${entry.tabId}`;
+}
+
+function updateTabOptions(entries) {
+  const tabs = new Map(entries.map((entry) => [tabKey(entry), entry.tabTitle || entry.origin || "Browser"]));
+  const signature = JSON.stringify([...tabs]);
+  if (signature === tabSignature) return;
+  tabSignature = signature;
+  const selected = tabFilter.value;
+  const all = document.createElement("option");
+  all.value = "all";
+  all.textContent = "All tabs";
+  const options = [...tabs].map(([value, label]) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    return option;
+  });
+  replaceChildren(tabFilter, [all, ...options]);
+  if (tabs.has(selected)) tabFilter.value = selected;
+}
+
+function filteredCommands(entries) {
+  const query = commandSearch.value.trim().toLowerCase();
+  return entries.filter((entry) => {
+    if (statusFilter.value !== "all" && entry.status !== statusFilter.value) return false;
+    if (tabFilter.value !== "all" && tabKey(entry) !== tabFilter.value) return false;
+    if (!query) return true;
+    return [entry.command, entry.tabTitle, entry.origin, entry.error]
+      .some((value) => String(value || "").toLowerCase().includes(query));
+  });
+}
+
 function renderCommands(entries) {
-  const signature = JSON.stringify(entries.map(({ id, status, tabTitle, command }) => [id, status, tabTitle, command]));
+  const visible = filteredCommands(entries);
+  const signature = JSON.stringify([
+    commandSearch.value,
+    statusFilter.value,
+    tabFilter.value,
+    visible.map(({ id, status, tabTitle, command, error, durationMs }) => [id, status, tabTitle, command, error, durationMs]),
+  ]);
   if (signature === commandSignature) return;
   commandSignature = signature;
-  const items = entries.map(commandRow);
+  const items = visible.map(commandRow);
   if (!items.length) {
     const empty = document.createElement("li");
     empty.className = "empty";
-    empty.textContent = "No commands yet.";
+    empty.textContent = entries.length ? "No commands match these filters." : "No commands yet.";
     items.push(empty);
   }
   replaceChildren(commands, items);
+
+  const errors = entries.filter((entry) => entry.status === "error").length;
+  const successes = entries.length - errors;
+  const shown = visible.length === entries.length ? "" : `${visible.length} shown · `;
+  const latest = entries[0]?.completedAt || entries[0]?.at;
+  logSummary.textContent = entries.length
+    ? `${shown}${errors} ${errors === 1 ? "error" : "errors"} · ${successes} successful · Updated ${formatClock(latest)}`
+    : "No commands recorded.";
 }
 
 function render(status) {
-  const online = status.bridgeOnline && status.nativeConnected;
+  const connectionState = status.connectionState || (status.bridgeOnline && status.nativeConnected ? "connected" : "disconnected");
+  const online = connectionState === "connected";
   const activeCommands = status.activeCommands || [];
   const activeCaptures = status.activeCaptures || [];
   const stats = status.activity || {};
-  connection.textContent = online ? "Connected" : "Disconnected";
-  connection.className = `status ${online ? "online" : "offline"}`;
+  const connectionLabels = {
+    connected: "Connected",
+    connecting: "Connecting…",
+    reconnecting: "Reconnecting…",
+    disconnected: "Disconnected",
+    unavailable: "Unavailable",
+  };
+  if (connection.dataset.state !== connectionState) {
+    connection.dataset.state = connectionState;
+    connection.textContent = connectionLabels[connectionState] || "Unavailable";
+    connection.className = `status ${online ? "online" : connectionState}`;
+  }
+  reconnect.hidden = !["reconnecting", "disconnected", "unavailable"].includes(connectionState);
   running.textContent = String(activeCommands.length);
   attachments.textContent = String((status.attachedTabs || []).length);
   requests.textContent = Number(stats.networkRequests || 0).toLocaleString();
   captures.textContent = String(activeCaptures.length);
-  activitySummary.textContent = `${Number(stats.commandsCompleted || 0).toLocaleString()} completed · ${Number(stats.commandsFailed || 0).toLocaleString()} failed · ${formatBytes(stats.networkBytes || 0)} captured · ${Number(stats.webSocketFrames || 0).toLocaleString()} WebSocket frames`;
+  activitySummary.textContent = `${online ? "Live" : "Extension-local"} · ${Number(stats.commandsCompleted || 0).toLocaleString()} completed · ${Number(stats.commandsFailed || 0).toLocaleString()} failed · ${formatBytes(stats.networkBytes || 0)} captured · ${Number(stats.webSocketFrames || 0).toLocaleString()} WebSocket frames`;
 
   const liveItems = activeCommands.map((command) => {
     const item = document.createElement("div");
@@ -338,13 +462,28 @@ function render(status) {
   if (!liveItems.length) {
     const empty = document.createElement("p");
     empty.className = "live-empty";
-    empty.textContent = "No command or capture is running. Start a network capture to watch requests here.";
+    empty.textContent = online
+      ? "Nothing is running. Start a command or network capture to watch it here."
+      : "The agent connection is unavailable. Counters above show extension-local state.";
     liveItems.push(empty);
   }
   replaceChildren(captureList, liveItems);
 
-  renderCommands(status.recentCommands);
-  updated.textContent = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
+  recentEntries = status.recentCommands || [];
+  updateTabOptions(recentEntries);
+  renderCommands(recentEntries);
+}
+
+function formatClock(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? "unknown"
+    : date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
+}
+
+function formatDuration(value) {
+  const milliseconds = Number(value) || 0;
+  return milliseconds < 1_000 ? `${milliseconds.toLocaleString()} ms` : `${(milliseconds / 1_000).toFixed(1)} s`;
 }
 
 function formatBytes(value) {
@@ -361,12 +500,12 @@ async function refresh() {
     if (!response?.ok) throw new Error(response?.error || "Status unavailable");
     render(response.status);
   } catch {
-    connection.textContent = "Unavailable";
-    connection.className = "status offline";
+    render({ connectionState: "unavailable", recentCommands: recentEntries });
   }
 }
 
 clearLogs.addEventListener("click", async () => {
+  if (recentEntries.length >= 10 && !window.confirm(`Clear ${recentEntries.length} command logs?`)) return;
   clearLogs.disabled = true;
   try {
     const response = await chrome.runtime.sendMessage({ type: "bridge-clear-logs" });
@@ -381,6 +520,21 @@ clearLogs.addEventListener("click", async () => {
     clearLogs.disabled = false;
   }
 });
+
+reconnect.addEventListener("click", async () => {
+  reconnect.disabled = true;
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "bridge-reconnect" });
+    if (!response?.ok) throw new Error(response?.error || "Unable to reconnect");
+    render(response.status);
+  } finally {
+    reconnect.disabled = false;
+  }
+});
+
+for (const control of [commandSearch, statusFilter, tabFilter]) {
+  control.addEventListener(control === commandSearch ? "input" : "change", () => renderCommands(recentEntries));
+}
 
 refresh();
 chrome.runtime.onMessage.addListener((message) => {

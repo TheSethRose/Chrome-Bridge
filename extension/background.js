@@ -3,6 +3,9 @@ const PROTOCOL_VERSION = "1.3";
 
 let nativePort;
 let hostOnline = false;
+let hasConnected = false;
+let reconnectTimer;
+let reconnectDelay = 1_000;
 let statusBroadcastTimer;
 let statusBroadcastQueued = false;
 const attachedOwners = new Map();
@@ -129,25 +132,53 @@ async function withRawDebugger(target, owner, callback) {
 
 function connectHost() {
   if (nativePort) return;
+  clearTimeout(reconnectTimer);
+  reconnectTimer = undefined;
+  let port;
   try {
-    nativePort = chrome.runtime.connectNative(HOST_NAME);
+    port = chrome.runtime.connectNative(HOST_NAME);
+    nativePort = port;
   } catch {
     nativePort = undefined;
+    scheduleReconnect();
     return;
   }
 
-  nativePort.onMessage.addListener(handleNativeMessage);
-  nativePort.onDisconnect.addListener(() => {
+  port.onMessage.addListener(handleNativeMessage);
+  port.onDisconnect.addListener(() => {
+    void chrome.runtime.lastError;
+    if (nativePort !== port) return;
     nativePort = undefined;
     hostOnline = false;
     scheduleStatusBroadcast();
+    scheduleReconnect();
   });
-  nativePort.postMessage({ type: "hello" });
+  port.postMessage({ type: "hello" });
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(connectHost, reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
+}
+
+function reconnectHost() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = undefined;
+  reconnectDelay = 1_000;
+  const port = nativePort;
+  nativePort = undefined;
+  hostOnline = false;
+  port?.disconnect();
+  connectHost();
+  scheduleStatusBroadcast();
 }
 
 async function handleNativeMessage(message) {
   if (message?.type === "helloResult") {
     hostOnline = Boolean(message.ok);
+    hasConnected ||= hostOnline;
+    if (hostOnline) reconnectDelay = 1_000;
     scheduleStatusBroadcast();
     return;
   }
@@ -209,6 +240,13 @@ function sendChunkedResponse(id, response) {
 }
 
 async function statusSnapshot() {
+  const connectionState = hostOnline
+    ? "connected"
+    : nativePort
+      ? "connecting"
+      : hasConnected
+        ? "reconnecting"
+        : "disconnected";
   const live = {
     attachedTabs: [...attachedOwners.keys()],
     activeCommands: [...activeCommands.values()],
@@ -232,6 +270,7 @@ async function statusSnapshot() {
   return {
     bridgeOnline: hostOnline,
     nativeConnected: Boolean(nativePort),
+    connectionState,
     ...live,
     recentCommands: auditLog.slice(-25).reverse(),
   };
@@ -260,9 +299,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         nativePort?.postMessage({ type: "clearLogs", id: crypto.randomUUID() });
         return statusSnapshot();
       })
-    : message?.type === "bridge-status"
-      ? statusSnapshot()
-      : null;
+    : message?.type === "bridge-reconnect"
+      ? (reconnectHost(), statusSnapshot())
+      : message?.type === "bridge-status"
+        ? statusSnapshot()
+        : null;
   if (!action) return false;
   action.then(
     (status) => {
@@ -285,9 +326,14 @@ chrome.runtime.onConnect.addListener((port) => {
 
 async function audit(id, command, params, tab, status, error) {
   const { auditLog = [] } = await chrome.storage.local.get("auditLog");
+  const completedAt = Date.now();
+  const startedAt = activeCommands.get(id)?.startedAt || completedAt;
   auditLog.push({
     id,
-    at: new Date().toISOString(),
+    at: new Date(completedAt).toISOString(),
+    startedAt,
+    completedAt,
+    durationMs: completedAt - startedAt,
     command,
     tabId: tab?.id,
     tabTitle: tab?.title || undefined,

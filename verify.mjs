@@ -20,6 +20,7 @@ const skillWorkflows = await read("skill/chrome-bridge/references/workflows.md")
 const cliSource = await read("bin/chrome-bridge.mjs");
 const sidepanelHtml = await read("extension/sidepanel.html");
 const sidepanelScript = await read("extension/sidepanel.js");
+const sidepanelCss = await read("extension/sidepanel.css");
 
 assert.equal(manifest.manifest_version, 3);
 assert.equal(manifest.background.type, "module");
@@ -39,6 +40,11 @@ assert.match(background, /requestChunk/);
 assert.match(background, /responseChunk/);
 assert.match(background, /bridge-status-update/);
 assert.match(background, /bridge-clear-logs/);
+assert.match(background, /bridge-reconnect/);
+assert.match(background, /function scheduleReconnect/);
+assert.match(background, /Math\.min\(reconnectDelay \* 2, 30_000\)/, "native-host reconnects must back off");
+assert.match(background, /void chrome\.runtime\.lastError/);
+assert.match(background, /durationMs: completedAt - startedAt/);
 assert.match(background, /auditLog\.slice\(-25\)/);
 const statusScheduler = background.match(/function scheduleStatusBroadcast\(\) \{[\s\S]*?\n\}/)?.[0] || "";
 assert.doesNotMatch(statusScheduler, /clearTimeout\(statusBroadcastTimer\)/, "busy network events must not starve status broadcasts");
@@ -52,13 +58,23 @@ assert.match(sidepanelScript, /entry\.tabTitle/);
 assert.match(sidepanelScript, /STRING_PAGE = 1_500/);
 assert.match(sidepanelScript, /COLLECTION_PAGE = 50/);
 assert.match(sidepanelScript, /command-disclosure\[open\]/);
+assert.match(sidepanelScript, /function filteredCommands/);
+assert.match(sidepanelScript, /function readableTimestamp/);
+assert.match(sidepanelScript, /item\.append\(disclosure, copy\)/, "copy control must sit beside details, not inside summary");
+assert.doesNotMatch(sidepanelScript, /summary\.append\([^\n]*copy/, "summary must not contain nested buttons");
 assert.doesNotMatch(sidepanelScript, /document\.createElement\("pre"\)/, "large log payloads must not render as a single preformatted block");
 assert.match(sidepanelHtml, /id="clear-logs"/);
+for (const id of ["reconnect", "command-search", "status-filter", "tab-filter", "log-summary"]) {
+  assert.match(sidepanelHtml, new RegExp(`id="${id}"`), `missing log control ${id}`);
+}
 for (const id of ["running", "attachments", "requests", "captures", "activity-summary"]) {
   assert.match(sidepanelHtml, new RegExp(`id="${id}"`), `missing live activity field ${id}`);
 }
 assert.match(sidepanelScript, /status\.activeCommands/);
 assert.match(sidepanelScript, /stats\.networkRequests/);
+assert.match(sidepanelCss, /\.command\.error/);
+assert.match(sidepanelCss, /\.command-state svg/);
+assert.match(sidepanelCss, /width: 40px; height: 40px/, "copy target must remain comfortably clickable");
 assert.doesNotMatch(sidepanelHtml, /<script(?![^>]*\bsrc=)/i, "side panel must not contain inline scripts");
 assert.match(skill, /^---\nname: chrome-bridge\ndescription:/);
 assert.match(skill, /references\/commands\.md/);
