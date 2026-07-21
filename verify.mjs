@@ -1,0 +1,183 @@
+import assert from "node:assert/strict";
+import { execFile as execFileCallback, spawn } from "node:child_process";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
+import { normalizeCommand, parseArguments, parseDuration } from "./bin/chrome-bridge.mjs";
+import { decodeNativeMessages, encodeNativeMessage } from "./native-host/host.mjs";
+
+const root = path.dirname(fileURLToPath(import.meta.url));
+const execFile = promisify(execFileCallback);
+const read = (file) => readFile(path.join(root, file), "utf8");
+const manifest = JSON.parse(await read("extension/manifest.json"));
+const background = await read("extension/background.js");
+const skill = await read("skill/chrome-bridge/SKILL.md");
+const cliSource = await read("bin/chrome-bridge.mjs");
+const sidepanelHtml = await read("extension/sidepanel.html");
+const sidepanelScript = await read("extension/sidepanel.js");
+
+assert.equal(manifest.manifest_version, 3);
+assert.equal(manifest.background.type, "module");
+assert.equal(manifest.content_security_policy.extension_pages, "script-src 'self'; object-src 'none'; base-uri 'none'");
+assert.ok(!manifest.externally_connectable, "web pages must not be allowed to message the extension");
+assert.equal(manifest.side_panel.default_path, "sidepanel.html");
+assert.equal(manifest.action.default_title, "Chrome Bridge status");
+for (const permission of ["debugger", "nativeMessaging", "tabs", "storage", "cookies", "history", "bookmarks", "downloads"]) {
+  assert.ok(manifest.permissions.includes(permission), `missing ${permission} permission`);
+}
+assert.deepEqual(manifest.host_permissions, ["<all_urls>"]);
+assert.doesNotMatch(background, /AUTHORIZATION_MS|pairingSecret|ensureAuthorized|authorizeTab|requestApproval|requireCapability|readOnly|redact|truncate|MAX_REQUESTS|MAX_EVENTS/);
+assert.doesNotMatch(background, /\brandomId\(/, "network sessions must use a defined browser-native ID source");
+assert.doesNotMatch(background, /cdp\([^\n]+"Target\.getTargets"/, "target inventory must use chrome.debugger.getTargets, which MV3 permits");
+assert.doesNotMatch(cliSource, /pairing-code|pairingCode|readSecret|redact/);
+assert.match(background, /requestChunk/);
+assert.match(background, /responseChunk/);
+assert.match(background, /bridge-status-update/);
+assert.match(background, /bridge-clear-logs/);
+assert.match(background, /auditLog\.slice\(-25\)/);
+assert.match(sidepanelScript, /chrome\.runtime\.onMessage/);
+assert.match(sidepanelScript, /document\.createElement\("details"\)/);
+assert.match(sidepanelScript, /navigator\.clipboard\.writeText/);
+assert.match(sidepanelScript, /entry\.tabTitle/);
+assert.match(sidepanelScript, /STRING_PAGE = 1_500/);
+assert.match(sidepanelScript, /COLLECTION_PAGE = 50/);
+assert.match(sidepanelScript, /command-disclosure\[open\]/);
+assert.doesNotMatch(sidepanelScript, /document\.createElement\("pre"\)/, "large log payloads must not render as a single preformatted block");
+assert.match(sidepanelHtml, /id="clear-logs"/);
+assert.doesNotMatch(sidepanelHtml, /<script(?![^>]*\bsrc=)/i, "side panel must not contain inline scripts");
+assert.match(skill, /^---\nname: chrome-bridge\ndescription:/);
+
+for (const command of [
+  "network-capture", "network-get-body", "console-capture", "scripts-get", "resources-get", "page-mhtml",
+  "dom-snapshot", "performance-trace", "history-search", "bookmarks-tree", "downloads-search", "cdp-send",
+]) {
+  assert.ok(background.includes(`case "${command}"`), `missing command handler ${command}`);
+}
+assert.match(background, /Target\.setAutoAttach/);
+
+assert.deepEqual(parseArguments(["network", "capture", "--tab=3", "--bodies"]), {
+  positionals: ["network", "capture"],
+  options: { tab: "3", bodies: true },
+});
+assert.equal(parseDuration("1.5s"), 1500);
+assert.deepEqual(normalizeCommand(parseArguments(["network", "capture", "--duration=2s"])), {
+  command: "network-capture",
+  params: { duration: 2_000 },
+});
+
+const framed = encodeNativeMessage({ hello: "world" });
+const decoded = [];
+const push = decodeNativeMessages((message) => decoded.push(message));
+push(framed.subarray(0, 3));
+push(framed.subarray(3, 8));
+push(framed.subarray(8));
+assert.deepEqual(decoded, [{ hello: "world" }]);
+
+async function waitFor(check, message) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const value = await check();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(message);
+}
+
+const testHome = await mkdtemp(path.join(os.tmpdir(), "chrome-bridge-test-"));
+const extensionId = "abcdefghijklmnopabcdefghijklmnop";
+await Promise.all([
+  mkdir(path.join(testHome, "requests")),
+  mkdir(path.join(testHome, "responses")),
+  writeFile(path.join(testHome, "config.json"), JSON.stringify({ extensionId })),
+]);
+const host = spawn(process.execPath, [path.join(root, "bin", "chrome-bridge.mjs"), `chrome-extension://${extensionId}/`], {
+  env: { ...process.env, CHROME_BRIDGE_HOME: testHome },
+  stdio: ["pipe", "pipe", "pipe"],
+});
+const hostMessages = [];
+host.stdout.on("data", decodeNativeMessages((message) => hostMessages.push(message)));
+host.stdin.write(encodeNativeMessage({ type: "hello" }));
+await waitFor(() => hostMessages.find((message) => message.type === "helloResult" && message.ok), "native host did not connect");
+
+const requestId = "request-1";
+const largeExpression = `token=${"x".repeat(1_200_000)}`;
+await writeFile(path.join(testHome, "requests", `${requestId}.json`), JSON.stringify({
+  id: requestId,
+  command: "eval",
+  params: { expression: largeExpression },
+  createdAt: Date.now(),
+}));
+await waitFor(() => hostMessages.find((message) => message.type === "requestEnd" && message.id === requestId), "native host did not forward chunked request");
+const reconstructed = JSON.parse(hostMessages
+  .filter((message) => message.type === "requestChunk" && message.id === requestId)
+  .sort((left, right) => left.index - right.index)
+  .map((message) => message.data)
+  .join(""));
+assert.equal(reconstructed.params.expression, largeExpression);
+
+const response = JSON.stringify({ ok: true, result: { token: largeExpression }, completedAt: Date.now() });
+host.stdin.write(encodeNativeMessage({ type: "responseStart", id: requestId }));
+for (let index = 0, offset = 0; offset < response.length; index += 1, offset += 400_000) {
+  host.stdin.write(encodeNativeMessage({ type: "responseChunk", id: requestId, index, data: response.slice(offset, offset + 400_000) }));
+}
+host.stdin.write(encodeNativeMessage({ type: "responseEnd", id: requestId }));
+const hostResponse = await waitFor(async () => {
+  try { return JSON.parse(await readFile(path.join(testHome, "responses", `${requestId}.json`), "utf8")); }
+  catch (error) { if (error.code === "ENOENT") return null; throw error; }
+}, "native host did not persist chunked response");
+assert.equal(hostResponse.result.token, largeExpression);
+
+const retainedRequest = JSON.parse(await readFile(path.join(testHome, "logs", `${requestId}.request.json`), "utf8"));
+const retainedResponse = JSON.parse(await readFile(path.join(testHome, "logs", `${requestId}.response.json`), "utf8"));
+assert.equal(retainedRequest.params.expression, largeExpression);
+assert.equal(retainedResponse.result.token, largeExpression);
+
+host.stdin.write(encodeNativeMessage({ type: "readLog", id: requestId }));
+await waitFor(() => hostMessages.find((message) => message.type === "logEnd" && message.id === requestId), "native host did not stream retained log data");
+const streamedPart = (part) => Buffer.concat(hostMessages
+  .filter((message) => message.type === "logChunk" && message.id === requestId && message.part === part)
+  .sort((left, right) => left.index - right.index)
+  .map((message) => Buffer.from(message.data, "base64")))
+  .toString("utf8");
+assert.equal(JSON.parse(streamedPart("request")).params.expression, largeExpression);
+assert.equal(JSON.parse(streamedPart("response")).result.token, largeExpression);
+
+host.stdin.write(encodeNativeMessage({ type: "clearLogs", id: "clear-1" }));
+await waitFor(() => hostMessages.find((message) => message.type === "logsCleared" && message.id === "clear-1"), "native host did not clear retained logs");
+assert.deepEqual(await readdir(path.join(testHome, "logs")), []);
+host.kill();
+await rm(testHome, { recursive: true, force: true });
+
+const setupHome = await mkdtemp(path.join(os.tmpdir(), "chrome-bridge-setup-test-"));
+const setupRuntime = path.join(setupHome, "runtime");
+await execFile(process.execPath, [path.join(root, "bin", "chrome-bridge.mjs"), "setup"], {
+  env: { ...process.env, HOME: setupHome, CHROME_BRIDGE_HOME: setupRuntime },
+});
+const installedManifest = JSON.parse(await readFile(path.join(
+  setupHome,
+  "Library",
+  "Application Support",
+  "Google",
+  "Chrome",
+  "NativeMessagingHosts",
+  "dev.sethrose.chrome_bridge.json",
+), "utf8"));
+const installedHost = spawn(installedManifest.path, installedManifest.allowed_origins, {
+  env: { HOME: setupHome, PATH: "/usr/bin:/bin", CHROME_BRIDGE_HOME: setupRuntime },
+  stdio: ["pipe", "pipe", "pipe"],
+});
+const installedMessages = [];
+let installedError = "";
+installedHost.stdout.on("data", decodeNativeMessages((message) => installedMessages.push(message)));
+installedHost.stderr.on("data", (chunk) => { installedError += chunk.toString(); });
+installedHost.stdin.write(encodeNativeMessage({ type: "hello" }));
+await waitFor(
+  () => installedMessages.find((message) => message.type === "helloResult" && message.ok),
+  `setup-generated native host did not survive Chrome's PATH: ${installedError}`,
+);
+installedHost.kill();
+await rm(setupHome, { recursive: true, force: true });
+
+console.log("Chrome Bridge contracts verified.");

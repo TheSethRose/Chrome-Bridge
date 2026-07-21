@@ -1,0 +1,17 @@
+{
+  "name": "chrome-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "chrome-bridge": "./bin/chrome-bridge.mjs"
+  },
+  "scripts": {
+    "setup": "node ./bin/chrome-bridge.mjs setup",
+    "verify": "node ./verify.mjs && node --check bin/chrome-bridge.mjs && node --check native-host/host.mjs && node --check shared/runtime.mjs && node --check extension/background.js && node --check extension/sidepanel.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

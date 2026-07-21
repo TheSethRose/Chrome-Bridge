@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Chrome Bridge",
+  "version": "0.1.0",
+  "description": "A local CLI bridge for inspecting and operating Chrome with CDP.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsALuu+KnJHpTTdjuHgrXrik3dAAm6hHQvQ1Fk8x7Ey0RXhmGnFIQnnxT5z6W74o/Mf2d4XZt4PnASK5TqNNNsOx03oIsRe4itzvaoxX6oMHOhnsZYCCDbkKKiKWBF3BpulyjlIpQbW2e40wSWqNJwoVNM2A9NT+ewHS6uapntoVqgMFzXeFl9pdU7msGoIuAY4dPyAR5baL4vc2pOMErWg5FTo53E3KdtBju/6OL3kXkyeHKgNWRv9UGdgsJPT/lBIdMCRbeILS2tOXz1TClx4DWCIWdYf1QxwfD2pQ8mU6Fi1U/VgwykhFB4xlmALaGUW4/uLNZFtrt+w+jpwKsuQIDAQAB",
+  "permissions": [
+    "bookmarks",
+    "cookies",
+    "debugger",
+    "downloads",
+    "history",
+    "nativeMessaging",
+    "sidePanel",
+    "storage",
+    "tabs",
+    "webNavigation"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Chrome Bridge status"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'"
+  },
+  "minimum_chrome_version": "125"
+}

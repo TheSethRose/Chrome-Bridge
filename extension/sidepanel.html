@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Chrome Bridge</title>
+    <link rel="stylesheet" href="sidepanel.css">
+  </head>
+  <body>
+    <header>
+      <div>
+        <p class="eyebrow">Agent connection</p>
+        <h1>Chrome Bridge</h1>
+      </div>
+      <span id="connection" class="status" aria-live="polite">Checking</span>
+    </header>
+
+    <main>
+      <section aria-labelledby="activity-title">
+        <h2 id="activity-title">Live activity</h2>
+        <dl class="metrics">
+          <div><dt>Debugger tabs</dt><dd id="attachments">0</dd></div>
+          <div><dt>Network captures</dt><dd id="captures">0</dd></div>
+        </dl>
+        <div id="capture-list" class="capture-list"></div>
+      </section>
+
+      <section aria-labelledby="commands-title">
+        <div class="section-heading">
+          <h2 id="commands-title">Recent Commands</h2>
+          <div class="log-actions">
+            <time id="updated"></time>
+            <button id="clear-logs" type="button">Clear logs</button>
+          </div>
+        </div>
+        <ol id="commands" class="commands">
+          <li class="empty">No commands yet.</li>
+        </ol>
+      </section>
+    </main>
+
+    <script src="sidepanel.js" type="module"></script>
+  </body>
+</html>
