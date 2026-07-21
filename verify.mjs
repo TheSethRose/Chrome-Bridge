@@ -14,6 +14,8 @@ const read = (file) => readFile(path.join(root, file), "utf8");
 const manifest = JSON.parse(await read("extension/manifest.json"));
 const background = await read("extension/background.js");
 const skill = await read("skill/chrome-bridge/SKILL.md");
+const skillCommands = await read("skill/chrome-bridge/references/commands.md");
+const skillWorkflows = await read("skill/chrome-bridge/references/workflows.md");
 const cliSource = await read("bin/chrome-bridge.mjs");
 const sidepanelHtml = await read("extension/sidepanel.html");
 const sidepanelScript = await read("extension/sidepanel.js");
@@ -48,6 +50,14 @@ assert.doesNotMatch(sidepanelScript, /document\.createElement\("pre"\)/, "large 
 assert.match(sidepanelHtml, /id="clear-logs"/);
 assert.doesNotMatch(sidepanelHtml, /<script(?![^>]*\bsrc=)/i, "side panel must not contain inline scripts");
 assert.match(skill, /^---\nname: chrome-bridge\ndescription:/);
+assert.match(skill, /references\/commands\.md/);
+assert.match(skill, /references\/workflows\.md/);
+for (const documented of ["network capture", "upload-file", "emulate", "cdp session-start", "chrome call"]) {
+  assert.match(skillCommands, new RegExp(documented.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `missing command reference for ${documented}`);
+}
+for (const workflow of ["Discover a private API", "persistent CDP session", "Develop another unpacked extension", "Recover from an interrupted task"]) {
+  assert.match(skillWorkflows, new RegExp(workflow), `missing workflow reference for ${workflow}`);
+}
 
 for (const command of [
   "network-capture", "network-get-body", "console-capture", "scripts-get", "resources-get", "page-mhtml",
@@ -78,6 +88,10 @@ assert.deepEqual(normalizeCommand(parseArguments(["cdp", "session-start", "--tar
 assert.deepEqual(normalizeCommand(parseArguments(["press-key", "Meta+A"])), {
   command: "press-key",
   params: { key: "Meta+A" },
+});
+assert.deepEqual(normalizeCommand(parseArguments(["new-tab", "https://example.com", "--active=false"])), {
+  command: "new-tab",
+  params: { active: false, url: "https://example.com" },
 });
 
 const framed = encodeNativeMessage({ hello: "world" });

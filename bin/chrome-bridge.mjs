@@ -107,6 +107,10 @@ export function normalizeCommand(parsed) {
   const first = words.shift();
   const second = words[0];
   const options = { ...parsed.options };
+  for (const key of ["active", "bodies", "har", "fullPage", "double", "mobile", "offline", "clear", "paintOrder", "domRects", "blendedColors", "textOpacities"]) {
+    if (options[key] === "true") options[key] = true;
+    if (options[key] === "false") options[key] = false;
+  }
 
   if (options.duration !== undefined) options.duration = parseDuration(options.duration, 10_000);
   if (options.maxDuration !== undefined) options.maxDuration = parseDuration(options.maxDuration, 60_000);

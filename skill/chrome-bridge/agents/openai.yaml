@@ -1,4 +1,4 @@
 interface:
   display_name: "Chrome Bridge"
-  short_description: "Inspect and debug the live Chrome session"
+  short_description: "Control and inspect the live Chrome session"
   default_prompt: "Use $chrome-bridge to inspect, debug, and operate the live Chrome tab needed for this task."

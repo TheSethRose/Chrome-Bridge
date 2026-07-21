@@ -13,6 +13,7 @@ const eventCollectors = new Map();
 const traceCollectors = new Map();
 const screencastCollectors = new Map();
 const emulationOwners = new Map();
+const dragResolvers = new Map();
 const manualCdpSessions = new Map();
 const requestChunks = new Map();
 const logViewerPorts = new Set();
@@ -657,31 +658,62 @@ async function drag(tabId, owner, params) {
     const from = params.fromSelector ? await elementPoint(target, params.fromSelector) : { x: Number(params.fromX), y: Number(params.fromY) };
     const to = params.toSelector ? await elementPoint(target, params.toSelector) : { x: Number(params.toX), y: Number(params.toY) };
     if (![from.x, from.y, to.x, to.y].every(Number.isFinite)) throw new Error("drag requires from/to selectors or coordinates");
-    await cdp(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: from.x, y: from.y });
-    await cdp(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: from.x, y: from.y, button: "left", buttons: 1, clickCount: 1 });
-    for (let step = 1; step <= 8; step += 1) {
-      await cdp(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: from.x + (to.x - from.x) * step / 8, y: from.y + (to.y - from.y) * step / 8, button: "left", buttons: 1 });
+    let resolveDrag;
+    const dragData = new Promise((resolve) => { resolveDrag = resolve; });
+    dragResolvers.set(tabId, resolveDrag);
+    await cdp(target, "Input.setInterceptDrags", { enabled: true });
+    try {
+      await cdp(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: from.x, y: from.y });
+      await cdp(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: from.x, y: from.y, button: "left", buttons: 1, clickCount: 1 });
+      await cdp(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: from.x + 8, y: from.y + 8, button: "left", buttons: 1 });
+      const data = await Promise.race([dragData, sleep(2_000).then(() => null)]);
+      if (!data) throw new Error("The source element did not start an HTML drag operation");
+      await cdp(target, "Input.dispatchDragEvent", { type: "dragEnter", x: to.x, y: to.y, data });
+      await cdp(target, "Input.dispatchDragEvent", { type: "dragOver", x: to.x, y: to.y, data });
+      await cdp(target, "Input.dispatchDragEvent", { type: "drop", x: to.x, y: to.y, data });
+      return { from, to };
+    } finally {
+      dragResolvers.delete(tabId);
+      await cdp(target, "Input.setInterceptDrags", { enabled: false }).catch(() => {});
+      await cdp(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: to.x, y: to.y, button: "left", buttons: 0, clickCount: 1 }).catch(() => {});
     }
-    await cdp(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: to.x, y: to.y, button: "left", buttons: 0, clickCount: 1 });
-    return { from, to };
   });
 }
 
 function keySpec(value) {
   const parts = String(value || "").split("+").filter(Boolean);
-  const key = parts.pop();
-  if (!key) throw new Error("press-key requires --key");
+  const requestedKey = parts.pop();
+  if (!requestedKey) throw new Error("press-key requires --key");
   const modifierBits = { alt: 1, control: 2, ctrl: 2, meta: 4, command: 4, shift: 8 };
+  const modifierKeys = parts.map((part) => ({ control: "Control", ctrl: "Control", meta: "Meta", command: "Meta", alt: "Alt", shift: "Shift" })[part.toLowerCase()]).filter(Boolean);
   const modifiers = parts.reduce((mask, part) => mask | (modifierBits[part.toLowerCase()] || 0), 0);
   const codes = { Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46, ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Home: 36, End: 35, PageUp: 33, PageDown: 34, Space: 32 };
-  return { key: key === "Space" ? " " : key, code: key, modifiers, windowsVirtualKeyCode: codes[key] || (key.length === 1 ? key.toUpperCase().charCodeAt(0) : 0) };
+  const key = requestedKey === "Space" ? " " : requestedKey.length === 1 ? requestedKey.toLowerCase() : requestedKey;
+  const code = /^[a-z]$/i.test(requestedKey) ? `Key${requestedKey.toUpperCase()}` : /^\d$/.test(requestedKey) ? `Digit${requestedKey}` : requestedKey;
+  return { key, code, modifiers, modifierKeys, windowsVirtualKeyCode: codes[requestedKey] || (requestedKey.length === 1 ? requestedKey.toUpperCase().charCodeAt(0) : 0) };
 }
 
 async function pressKey(tabId, owner, params) {
   const spec = keySpec(params.key);
   return withDebugger(tabId, owner, async (target) => {
-    await cdp(target, "Input.dispatchKeyEvent", { type: "rawKeyDown", ...spec });
-    await cdp(target, "Input.dispatchKeyEvent", { type: "keyUp", ...spec });
+    const { modifierKeys, ...mainKey } = spec;
+    let activeModifiers = 0;
+    const modifierSpecs = { Alt: { code: "AltLeft", bit: 1, windowsVirtualKeyCode: 18 }, Control: { code: "ControlLeft", bit: 2, windowsVirtualKeyCode: 17 }, Meta: { code: "MetaLeft", bit: 4, windowsVirtualKeyCode: 91 }, Shift: { code: "ShiftLeft", bit: 8, windowsVirtualKeyCode: 16 } };
+    try {
+      for (const key of modifierKeys) {
+        const modifier = modifierSpecs[key];
+        activeModifiers |= modifier.bit;
+        await cdp(target, "Input.dispatchKeyEvent", { type: "rawKeyDown", key, code: modifier.code, modifiers: activeModifiers, windowsVirtualKeyCode: modifier.windowsVirtualKeyCode });
+      }
+      await cdp(target, "Input.dispatchKeyEvent", { type: "rawKeyDown", ...mainKey, modifiers: activeModifiers });
+      await cdp(target, "Input.dispatchKeyEvent", { type: "keyUp", ...mainKey, modifiers: activeModifiers });
+    } finally {
+      for (const key of [...modifierKeys].reverse()) {
+        const modifier = modifierSpecs[key];
+        activeModifiers &= ~modifier.bit;
+        await cdp(target, "Input.dispatchKeyEvent", { type: "keyUp", key, code: modifier.code, modifiers: activeModifiers, windowsVirtualKeyCode: modifier.windowsVirtualKeyCode }).catch(() => {});
+      }
+    }
     return spec;
   });
 }
@@ -709,13 +741,14 @@ async function uploadFile(tabId, owner, params) {
   const files = jsonValue(params.files, params.file ? [params.file] : []);
   if (!Array.isArray(files) || !files.length) throw new Error("upload-file requires --file or --files");
   return withDebugger(tabId, owner, async (target) => {
-    await cdp(target, "DOM.enable");
     const found = await cdp(target, "Runtime.evaluate", { expression: `document.querySelector(${JSON.stringify(selector)})`, returnByValue: false });
     if (!found.result?.objectId) throw new Error("File input not found");
-    const { node } = await cdp(target, "DOM.describeNode", { objectId: found.result.objectId });
-    await cdp(target, "DOM.setFileInputFiles", { nodeId: node.nodeId, files: files.map(String) });
-    await cdp(target, "Runtime.releaseObject", { objectId: found.result.objectId }).catch(() => {});
-    return { selector, files };
+    try {
+      await cdp(target, "DOM.setFileInputFiles", { objectId: found.result.objectId, files: files.map(String) });
+      return { selector, files };
+    } finally {
+      await cdp(target, "Runtime.releaseObject", { objectId: found.result.objectId }).catch(() => {});
+    }
   });
 }
 
@@ -1274,6 +1307,8 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
   const tabId = source.tabId;
   if (!tabId) return;
+
+  if (method === "Input.dragIntercepted") dragResolvers.get(tabId)?.(params.data);
 
   const captureId = networkCaptureByTab.get(tabId);
   const capture = captureId && networkCaptures.get(captureId);
