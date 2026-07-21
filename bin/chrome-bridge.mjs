@@ -136,14 +136,21 @@ export function normalizeCommand(parsed) {
     "bookmarks tree": "bookmarks-tree",
     "bookmarks search": "bookmarks-search",
     "downloads search": "downloads-search",
+    "extensions list": "extensions-list",
+    "extension reload": "extension-reload",
+    "chrome call": "chrome-call",
     "cdp send": "cdp-send",
     "cdp events": "cdp-events",
+    "cdp session-start": "cdp-session-start",
+    "cdp session-stop": "cdp-session-stop",
   };
   const pair = `${first || ""} ${second || ""}`;
   const command = nested[pair] || first;
   if (nested[pair]) words.shift();
   if (command === "eval") options.expression = words.join(" ");
-  if (command === "navigate" && !options.url && words.length) options.url = words.join(" ");
+  if (["navigate", "new-tab"].includes(command) && !options.url && words.length) options.url = words.join(" ");
+  if (["type-text", "wait-for"].includes(command) && !options.text && words.length) options.text = words.join(" ");
+  if (command === "press-key" && !options.key && words.length) options.key = words.join("+");
   if (command === "network-get-body" && !options.request && words.length) options.request = words[0];
   return { command, params: options };
 }
@@ -183,14 +190,17 @@ function help() {
   return {
     usage: "chrome-bridge <command> [options]",
     commands: [
-      "status | list-tabs | activate-tab | navigate | reload | go-back | detach",
-      "snapshot | dom | dom snapshot | visible-text | styles | screenshot | eval | click | type",
+      "status | list-tabs | new-tab | close-tab | activate-tab | navigate | reload | go-back | go-forward | detach",
+      "snapshot | dom | dom snapshot | visible-text | styles | screenshot | screencast | eval",
+      "click | hover | drag | type | type-text | press-key | fill-form | upload-file | wait-for | handle-dialog",
+      "resize | emulate",
       "network capture|start|tail|stop|get-body|export-har",
       "console capture | scripts list|get | resources tree|get | page mhtml",
       "storage | cookies | targets",
       "performance metrics|profile|trace",
       "history search | bookmarks tree|search | downloads search | audit",
-      "cdp send | cdp events",
+      "extensions list | extension reload | chrome call",
+      "cdp session-start|session-stop | cdp send|events",
     ],
     commonOptions: ["--tab=ID", "--duration=10s", "--timeout=30s", "--file=PATH"],
   };

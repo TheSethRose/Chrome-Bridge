@@ -24,7 +24,7 @@ assert.equal(manifest.content_security_policy.extension_pages, "script-src 'self
 assert.ok(!manifest.externally_connectable, "web pages must not be allowed to message the extension");
 assert.equal(manifest.side_panel.default_path, "sidepanel.html");
 assert.equal(manifest.action.default_title, "Chrome Bridge status");
-for (const permission of ["debugger", "nativeMessaging", "tabs", "storage", "cookies", "history", "bookmarks", "downloads"]) {
+for (const permission of ["debugger", "nativeMessaging", "tabs", "storage", "cookies", "history", "bookmarks", "downloads", "management", "sessions", "tabGroups", "topSites"]) {
   assert.ok(manifest.permissions.includes(permission), `missing ${permission} permission`);
 }
 assert.deepEqual(manifest.host_permissions, ["<all_urls>"]);
@@ -52,10 +52,15 @@ assert.match(skill, /^---\nname: chrome-bridge\ndescription:/);
 for (const command of [
   "network-capture", "network-get-body", "console-capture", "scripts-get", "resources-get", "page-mhtml",
   "dom-snapshot", "performance-trace", "history-search", "bookmarks-tree", "downloads-search", "cdp-send",
+  "new-tab", "close-tab", "go-forward", "hover", "drag", "press-key", "fill-form", "upload-file",
+  "wait-for", "handle-dialog", "resize", "emulate", "screencast", "cdp-session-start", "cdp-session-stop",
 ]) {
   assert.ok(background.includes(`case "${command}"`), `missing command handler ${command}`);
 }
 assert.match(background, /Target\.setAutoAttach/);
+assert.match(background, /manualCdpSessions/);
+assert.match(background, /chrome\[namespace\]/);
+assert.doesNotMatch(background, /ALLOWED_CDP_DOMAINS/, "raw CDP must let Chrome decide protocol support");
 
 assert.deepEqual(parseArguments(["network", "capture", "--tab=3", "--bodies"]), {
   positionals: ["network", "capture"],
@@ -65,6 +70,14 @@ assert.equal(parseDuration("1.5s"), 1500);
 assert.deepEqual(normalizeCommand(parseArguments(["network", "capture", "--duration=2s"])), {
   command: "network-capture",
   params: { duration: 2_000 },
+});
+assert.deepEqual(normalizeCommand(parseArguments(["cdp", "session-start", "--target=worker-1"])), {
+  command: "cdp-session-start",
+  params: { target: "worker-1" },
+});
+assert.deepEqual(normalizeCommand(parseArguments(["press-key", "Meta+A"])), {
+  command: "press-key",
+  params: { key: "Meta+A" },
 });
 
 const framed = encodeNativeMessage({ hello: "world" });

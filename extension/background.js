@@ -11,6 +11,8 @@ const consoleCaptures = new Map();
 const scriptCollectors = new Map();
 const eventCollectors = new Map();
 const traceCollectors = new Map();
+const screencastCollectors = new Map();
+const emulationOwners = new Map();
 const manualCdpSessions = new Map();
 const requestChunks = new Map();
 const logViewerPorts = new Set();
@@ -68,7 +70,8 @@ async function detachAll(tabId) {
   }
   consoleCaptures.delete(tabId);
   scriptCollectors.delete(tabId);
-  eventCollectors.delete(tabId);
+  eventCollectors.delete(`tab:${tabId}`);
+  emulationOwners.delete(tabId);
   for (const [id, session] of manualCdpSessions) {
     if (session.target.tabId === tabId) manualCdpSessions.delete(id);
   }
@@ -191,6 +194,7 @@ async function statusSnapshot() {
       target: session.target,
       startedAt: new Date(session.startedAt).toISOString(),
     })),
+    emulatedTabs: [...emulationOwners.keys()],
     recentCommands: auditLog.slice(-25).reverse(),
   };
 }
@@ -256,12 +260,23 @@ async function executeCommand(command, params, requestId) {
     if (command === "status") return statusSnapshot();
     if (command === "list-tabs") return listTabs();
     if (command === "targets" && params.tab === undefined) return { debuggerTargets: await chrome.debugger.getTargets() };
+    if (["chrome-call", "extensions-list", "extension-reload"].includes(command)) {
+      const result = command === "chrome-call"
+        ? await rawChromeApi(params)
+        : command === "extensions-list"
+          ? await chrome.management.getAll()
+          : await reloadExtension(params.extension);
+      await audit(requestId, command, params, undefined, "ok");
+      return result;
+    }
     if (command === "audit") {
       const { auditLog = [] } = await chrome.storage.local.get("auditLog");
       return auditLog.slice().reverse();
     }
 
-    const targetOnlyCommand = ["cdp-session-start", "cdp-session-stop", "cdp-send", "cdp-events"].includes(command) && params.target;
+    const targetOnlyCommand = command === "cdp-session-stop"
+      || (["cdp-send", "cdp-events"].includes(command) && (params.target || params.bridgeSession))
+      || (command === "cdp-session-start" && params.target);
     tab = targetOnlyCommand ? undefined : await resolveTab(params.tab);
     const owner = `command:${requestId}`;
     let result;
@@ -278,7 +293,7 @@ async function executeCommand(command, params, requestId) {
         result = { closed: true, tabId: tab.id };
         break;
       case "navigate":
-        result = await chrome.tabs.update(tab.id, { url: validateUrl(params.url) });
+        result = await chrome.tabs.update(tab.id, { url: navigableUrl(params.url) });
         break;
       case "reload":
         await chrome.tabs.reload(tab.id);
@@ -303,6 +318,9 @@ async function executeCommand(command, params, requestId) {
         break;
       case "screenshot":
         result = await screenshot(tab.id, owner, params);
+        break;
+      case "screencast":
+        result = await captureScreencast(tab.id, owner, params);
         break;
       case "eval":
         result = await evaluate(tab, owner, params);
@@ -462,6 +480,26 @@ async function listTabs() {
   }));
 }
 
+async function rawChromeApi(params) {
+  const namespace = String(params.api || "");
+  const method = String(params.method || "");
+  const api = chrome[namespace];
+  if (!api || typeof api[method] !== "function") throw new Error("chrome call requires a callable --api and --method");
+  const args = jsonValue(params.args, []);
+  if (!Array.isArray(args)) throw new Error("chrome call --args must be a JSON array");
+  return api[method](...args);
+}
+
+async function reloadExtension(extensionIdValue) {
+  const extensionId = String(extensionIdValue || "");
+  if (!extensionId) throw new Error("extension reload requires --extension=ID");
+  if (extensionId === chrome.runtime.id) throw new Error("Chrome Bridge cannot reload itself while returning a CLI response; reload it from chrome://extensions");
+  const extension = await chrome.management.get(extensionId);
+  await chrome.management.setEnabled(extensionId, false);
+  await chrome.management.setEnabled(extensionId, true);
+  return { reloaded: true, extension: { id: extension.id, name: extension.name, type: extension.type } };
+}
+
 function navigableUrl(value) {
   const url = String(value || "");
   if (!url) throw new Error("A URL is required");
@@ -499,13 +537,47 @@ async function screenshot(tabId, owner, params) {
   return withDebugger(tabId, owner, async (target) => {
     await cdp(target, "Page.enable");
     const format = params.format === "jpeg" ? "jpeg" : "png";
+    let clip;
+    if (params.selector) {
+      const selector = checkedSelector(params.selector);
+      const measured = await cdp(target, "Runtime.evaluate", {
+        expression: `(() => { const el=document.querySelector(${JSON.stringify(selector)}); if(!el) throw new Error('Element not found'); el.scrollIntoView({block:'center',inline:'center'}); const r=el.getBoundingClientRect(); return {x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1}; })()`,
+        returnByValue: true,
+      });
+      if (measured.exceptionDetails) throw new Error(measured.exceptionDetails.exception?.description || "Element screenshot failed");
+      clip = measured.result.value;
+    }
     const result = await cdp(target, "Page.captureScreenshot", {
       format,
       quality: format === "jpeg" ? Math.max(1, Math.min(100, Number(params.quality) || 85)) : undefined,
       captureBeyondViewport: params.fullPage !== false,
+      clip,
     });
     return { data: result.data, format, tabId };
   });
+}
+
+async function captureScreencast(tabId, owner, params) {
+  if (screencastCollectors.has(tabId)) throw new Error(`Tab ${tabId} already has a screencast running`);
+  const collector = { frames: [] };
+  screencastCollectors.set(tabId, collector);
+  try {
+    return await withDebugger(tabId, owner, async (target) => {
+      await cdp(target, "Page.enable");
+      await cdp(target, "Page.startScreencast", {
+        format: params.format === "png" ? "png" : "jpeg",
+        quality: Math.max(1, Math.min(100, Number(params.quality) || 80)),
+        maxWidth: params.width === undefined ? undefined : Number(params.width),
+        maxHeight: params.height === undefined ? undefined : Number(params.height),
+        everyNthFrame: Math.max(1, Number(params.everyNthFrame) || 1),
+      });
+      await sleep(durationMs(params.duration, 5_000));
+      await cdp(target, "Page.stopScreencast");
+      return { format: "cdp-screencast-frames", frames: collector.frames };
+    });
+  } finally {
+    screencastCollectors.delete(tabId);
+  }
 }
 
 async function evaluate(tab, owner, params) {
@@ -530,13 +602,24 @@ function checkedSelector(value) {
   return selector;
 }
 
-async function click(tabId, owner, selectorValue) {
+async function elementPoint(target, selectorValue) {
   const selector = checkedSelector(selectorValue);
+  const result = await cdp(target, "Runtime.evaluate", {
+    expression: `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) throw new Error('Element not found'); el.scrollIntoView({block:'center',inline:'center'}); const r = el.getBoundingClientRect(); return {x:r.left+r.width/2,y:r.top+r.height/2,tag:el.tagName,text:el.innerText||el.value||''}; })()`,
+    returnByValue: true,
+  });
+  if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "Element lookup failed");
+  return result.result.value;
+}
+
+async function click(tabId, owner, params) {
   return withDebugger(tabId, owner, async (target) => {
-    const expression = `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) throw new Error('Element not found'); el.click(); return {tag: el.tagName, text: el.innerText || el.value || ''}; })()`;
-    const result = await cdp(target, "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
-    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "Click failed");
-    return result.result?.value;
+    const point = params.selector ? await elementPoint(target, params.selector) : { x: Number(params.x), y: Number(params.y) };
+    if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) throw new Error("click requires --selector or numeric --x and --y");
+    const clickCount = params.double ? 2 : 1;
+    await cdp(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount });
+    await cdp(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", clickCount });
+    return { ...point, clickCount };
   });
 }
 
@@ -544,11 +627,191 @@ async function typeText(tabId, owner, selectorValue, textValue) {
   const selector = checkedSelector(selectorValue);
   const text = String(textValue ?? "");
   return withDebugger(tabId, owner, async (target) => {
-    const expression = `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) throw new Error('Element not found'); el.focus(); el.value = ${JSON.stringify(text)}; el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: ${JSON.stringify(text)}})); el.dispatchEvent(new Event('change', {bubbles: true})); return {tag: el.tagName, length: el.value.length}; })()`;
-    const result = await cdp(target, "Runtime.evaluate", { expression, returnByValue: true });
-    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "Type failed");
-    return result.result?.value;
+    const expression = `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) throw new Error('Element not found'); el.focus(); if ('select' in el) el.select(); else if (el.isContentEditable) document.execCommand('selectAll'); return {tag:el.tagName}; })()`;
+    const focused = await cdp(target, "Runtime.evaluate", { expression, returnByValue: true });
+    if (focused.exceptionDetails) throw new Error(focused.exceptionDetails.exception?.description || "Type failed");
+    await cdp(target, "Input.insertText", { text });
+    return { ...focused.result?.value, length: text.length };
   });
+}
+
+async function typeFocused(tabId, owner, params) {
+  const text = String(params.text ?? "");
+  return withDebugger(tabId, owner, async (target) => {
+    await cdp(target, "Input.insertText", { text });
+    return { length: text.length };
+  });
+}
+
+async function hover(tabId, owner, params) {
+  return withDebugger(tabId, owner, async (target) => {
+    const point = params.selector ? await elementPoint(target, params.selector) : { x: Number(params.x), y: Number(params.y) };
+    if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) throw new Error("hover requires --selector or numeric --x and --y");
+    await cdp(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y });
+    return point;
+  });
+}
+
+async function drag(tabId, owner, params) {
+  return withDebugger(tabId, owner, async (target) => {
+    const from = params.fromSelector ? await elementPoint(target, params.fromSelector) : { x: Number(params.fromX), y: Number(params.fromY) };
+    const to = params.toSelector ? await elementPoint(target, params.toSelector) : { x: Number(params.toX), y: Number(params.toY) };
+    if (![from.x, from.y, to.x, to.y].every(Number.isFinite)) throw new Error("drag requires from/to selectors or coordinates");
+    await cdp(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: from.x, y: from.y });
+    await cdp(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: from.x, y: from.y, button: "left", buttons: 1, clickCount: 1 });
+    for (let step = 1; step <= 8; step += 1) {
+      await cdp(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: from.x + (to.x - from.x) * step / 8, y: from.y + (to.y - from.y) * step / 8, button: "left", buttons: 1 });
+    }
+    await cdp(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: to.x, y: to.y, button: "left", buttons: 0, clickCount: 1 });
+    return { from, to };
+  });
+}
+
+function keySpec(value) {
+  const parts = String(value || "").split("+").filter(Boolean);
+  const key = parts.pop();
+  if (!key) throw new Error("press-key requires --key");
+  const modifierBits = { alt: 1, control: 2, ctrl: 2, meta: 4, command: 4, shift: 8 };
+  const modifiers = parts.reduce((mask, part) => mask | (modifierBits[part.toLowerCase()] || 0), 0);
+  const codes = { Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46, ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Home: 36, End: 35, PageUp: 33, PageDown: 34, Space: 32 };
+  return { key: key === "Space" ? " " : key, code: key, modifiers, windowsVirtualKeyCode: codes[key] || (key.length === 1 ? key.toUpperCase().charCodeAt(0) : 0) };
+}
+
+async function pressKey(tabId, owner, params) {
+  const spec = keySpec(params.key);
+  return withDebugger(tabId, owner, async (target) => {
+    await cdp(target, "Input.dispatchKeyEvent", { type: "rawKeyDown", ...spec });
+    await cdp(target, "Input.dispatchKeyEvent", { type: "keyUp", ...spec });
+    return spec;
+  });
+}
+
+function jsonValue(value, fallback) {
+  if (value === undefined) return fallback;
+  return typeof value === "string" ? JSON.parse(value) : value;
+}
+
+async function fillForm(tabId, owner, params) {
+  const elements = jsonValue(params.elements, []);
+  if (!Array.isArray(elements) || !elements.length) throw new Error("fill-form requires --elements as a JSON array");
+  return withDebugger(tabId, owner, async (target) => {
+    const result = await cdp(target, "Runtime.evaluate", {
+      expression: `(() => { const items=${JSON.stringify(elements)}; return items.map(({selector,value}) => { const el=document.querySelector(selector); if(!el) throw new Error('Element not found: '+selector); if(el.type==='checkbox'||el.type==='radio') el.checked=value===true||value==='true'; else if(el.tagName==='SELECT') el.value=String(value); else el.value=String(value); el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); return {selector,tag:el.tagName}; }); })()`,
+      returnByValue: true,
+    });
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "Form fill failed");
+    return result.result.value;
+  });
+}
+
+async function uploadFile(tabId, owner, params) {
+  const selector = checkedSelector(params.selector);
+  const files = jsonValue(params.files, params.file ? [params.file] : []);
+  if (!Array.isArray(files) || !files.length) throw new Error("upload-file requires --file or --files");
+  return withDebugger(tabId, owner, async (target) => {
+    await cdp(target, "DOM.enable");
+    const found = await cdp(target, "Runtime.evaluate", { expression: `document.querySelector(${JSON.stringify(selector)})`, returnByValue: false });
+    if (!found.result?.objectId) throw new Error("File input not found");
+    const { node } = await cdp(target, "DOM.describeNode", { objectId: found.result.objectId });
+    await cdp(target, "DOM.setFileInputFiles", { nodeId: node.nodeId, files: files.map(String) });
+    await cdp(target, "Runtime.releaseObject", { objectId: found.result.objectId }).catch(() => {});
+    return { selector, files };
+  });
+}
+
+async function waitForPage(tabId, owner, params) {
+  const timeout = durationMs(params.duration ?? params.waitTimeout, 30_000);
+  const deadline = Date.now() + timeout;
+  const expression = params.expression
+    ? `Boolean(${params.expression})`
+    : params.selector
+      ? `Boolean(document.querySelector(${JSON.stringify(String(params.selector))}))`
+      : `Boolean(document.body?.innerText.includes(${JSON.stringify(String(params.text || ""))}))`;
+  return withDebugger(tabId, owner, async (target) => {
+    while (Date.now() <= deadline) {
+      const result = await cdp(target, "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
+      if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "Wait expression failed");
+      if (result.result?.value) return { matched: true, elapsedMs: timeout - Math.max(0, deadline - Date.now()) };
+      await sleep(100);
+    }
+    throw new Error(`Condition did not match within ${timeout}ms`);
+  });
+}
+
+async function handleDialog(tabId, owner, params) {
+  return withDebugger(tabId, owner, async (target) => {
+    await cdp(target, "Page.handleJavaScriptDialog", { accept: String(params.action || "accept") !== "dismiss", promptText: params.promptText === undefined ? undefined : String(params.promptText) });
+    return { action: params.action || "accept" };
+  });
+}
+
+async function resizePage(tabId, owner, params) {
+  const width = Number(params.width);
+  const height = Number(params.height);
+  if (!(width > 0 && height > 0)) throw new Error("resize requires positive --width and --height");
+  const hadEmulation = emulationOwners.has(tabId);
+  const target = await emulationTarget(tabId);
+  try {
+    await cdp(target, "Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: Number(params.deviceScaleFactor) || 1, mobile: Boolean(params.mobile) });
+    return { width, height, persistent: true };
+  } catch (error) {
+    if (!hadEmulation) {
+      const emulationOwner = emulationOwners.get(tabId);
+      emulationOwners.delete(tabId);
+      await detach(tabId, emulationOwner);
+    }
+    throw error;
+  }
+}
+
+async function emulatePage(tabId, owner, params) {
+  const hadEmulation = emulationOwners.has(tabId);
+  const target = await emulationTarget(tabId);
+  try {
+    if (params.clear) {
+      await Promise.allSettled([
+        cdp(target, "Emulation.clearDeviceMetricsOverride"),
+        cdp(target, "Emulation.clearGeolocationOverride"),
+        cdp(target, "Emulation.setCPUThrottlingRate", { rate: 1 }),
+        cdp(target, "Network.emulateNetworkConditions", { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }),
+        cdp(target, "Network.setExtraHTTPHeaders", { headers: {} }),
+      ]);
+      const emulationOwner = emulationOwners.get(tabId);
+      emulationOwners.delete(tabId);
+      await detach(tabId, emulationOwner);
+      return { cleared: true };
+    }
+    if (params.viewport) {
+      const match = String(params.viewport).match(/^(\d+)x(\d+)(?:x([\d.]+))?$/);
+      if (!match) throw new Error("--viewport must be WIDTHxHEIGHT or WIDTHxHEIGHTxDPR");
+      await cdp(target, "Emulation.setDeviceMetricsOverride", { width: Number(match[1]), height: Number(match[2]), deviceScaleFactor: Number(match[3] || 1), mobile: Boolean(params.mobile) });
+    }
+    if (params.cpu !== undefined) await cdp(target, "Emulation.setCPUThrottlingRate", { rate: Math.max(1, Number(params.cpu)) });
+    if (params.latitude !== undefined || params.longitude !== undefined) await cdp(target, "Emulation.setGeolocationOverride", { latitude: Number(params.latitude), longitude: Number(params.longitude), accuracy: Number(params.accuracy) || 1 });
+    if (params.userAgent !== undefined) await cdp(target, "Emulation.setUserAgentOverride", { userAgent: String(params.userAgent) });
+    if (params.colorScheme) await cdp(target, "Emulation.setEmulatedMedia", { features: params.colorScheme === "auto" ? [] : [{ name: "prefers-color-scheme", value: String(params.colorScheme) }] });
+    if (params.headers !== undefined) await cdp(target, "Network.setExtraHTTPHeaders", { headers: jsonValue(params.headers, {}) });
+    if ([params.offline, params.latency, params.download, params.upload].some((value) => value !== undefined)) {
+      await cdp(target, "Network.emulateNetworkConditions", { offline: Boolean(params.offline), latency: Number(params.latency) || 0, downloadThroughput: params.download === undefined ? -1 : Number(params.download), uploadThroughput: params.upload === undefined ? -1 : Number(params.upload) });
+    }
+    return { configured: true, persistent: true };
+  } catch (error) {
+    if (!params.clear && !hadEmulation) {
+      const emulationOwner = emulationOwners.get(tabId);
+      emulationOwners.delete(tabId);
+      await detach(tabId, emulationOwner);
+    }
+    throw error;
+  }
+}
+
+async function emulationTarget(tabId) {
+  if (!emulationOwners.has(tabId)) {
+    const owner = `emulation:${tabId}`;
+    await attach(tabId, owner);
+    emulationOwners.set(tabId, owner);
+  }
+  return { tabId };
 }
 
 function durationMs(value, fallback = 10_000) {
@@ -941,36 +1204,74 @@ async function performanceTrace(tabId, owner, params) {
 
 function cdpMethod(params) {
   const method = String(params.method || (params.domain && params.command ? `${params.domain}.${params.command}` : ""));
-  const [domain] = method.split(".");
-  if (!method.includes(".") || !ALLOWED_CDP_DOMAINS.has(domain)) throw new Error("Raw CDP method is missing or unavailable to chrome.debugger");
+  if (!/^[A-Za-z][A-Za-z0-9]*\.[A-Za-z][A-Za-z0-9]*$/.test(method)) throw new Error("A CDP method such as Runtime.evaluate is required");
   return method;
 }
 
 async function rawCdp(tab, owner, params) {
   const method = cdpMethod(params);
   const commandParams = typeof params.params === "string" ? JSON.parse(params.params) : (params.params || {});
-  const target = params.sessionId ? { tabId: tab.id, sessionId: String(params.sessionId) } : { tabId: tab.id };
-  return withDebugger(tab.id, owner, async () => cdp(target, method, commandParams));
+  const persistent = params.bridgeSession && manualCdpSessions.get(String(params.bridgeSession));
+  if (params.bridgeSession && !persistent) throw new Error("Unknown CDP bridge session");
+  const root = persistent?.target || (params.target ? { targetId: String(params.target) } : { tabId: tab.id });
+  const target = params.sessionId ? { ...root, sessionId: String(params.sessionId) } : root;
+  if (persistent) return cdp(target, method, commandParams);
+  return withRawDebugger(root, owner, async () => cdp(target, method, commandParams));
 }
 
-async function captureCdpEvents(tabId, owner, params) {
+async function startCdpSession(tab, params) {
+  const id = crypto.randomUUID();
+  const target = params.target ? { targetId: String(params.target) } : { tabId: tab.id };
+  const owner = `cdp-session:${id}`;
+  if (target.tabId !== undefined) await attach(target.tabId, owner);
+  else {
+    const existing = (await chrome.debugger.getTargets()).find((candidate) => candidate.id === target.targetId && candidate.attached);
+    if (existing) throw new Error(`Target ${target.targetId} is already attached to another debugger client`);
+    await chrome.debugger.attach(target, PROTOCOL_VERSION);
+  }
+  const session = { id, target, owner, startedAt: Date.now() };
+  manualCdpSessions.set(id, session);
+  scheduleStatusBroadcast();
+  return { session: id, target, startedAt: new Date(session.startedAt).toISOString() };
+}
+
+async function stopCdpSession(idValue) {
+  const id = String(idValue || "");
+  const session = manualCdpSessions.get(id);
+  if (!session) throw new Error("cdp session stop requires a valid --bridge-session");
+  manualCdpSessions.delete(id);
+  if (session.target.tabId !== undefined) await detach(session.target.tabId, session.owner);
+  else await chrome.debugger.detach(session.target).catch(() => {});
+  scheduleStatusBroadcast();
+  return { stopped: true, session: id, target: session.target };
+}
+
+async function captureCdpEvents(tab, owner, params) {
   const domain = String(params.domain || "");
-  if (!ALLOWED_CDP_DOMAINS.has(domain)) throw new Error("A supported CDP --domain is required");
-  if (eventCollectors.has(tabId)) throw new Error(`Tab ${tabId} already has a raw event capture`);
+  if (!/^[A-Za-z][A-Za-z0-9]*$/.test(domain)) throw new Error("A CDP --domain is required");
+  const persistent = params.bridgeSession && manualCdpSessions.get(String(params.bridgeSession));
+  if (params.bridgeSession && !persistent) throw new Error("Unknown CDP bridge session");
+  const target = persistent?.target || (params.target ? { targetId: String(params.target) } : { tabId: tab.id });
+  const key = debuggeeKey(target);
+  if (eventCollectors.has(key)) throw new Error(`${key} already has a raw event capture`);
   const collector = { domain, events: [] };
-  eventCollectors.set(tabId, collector);
+  eventCollectors.set(key, collector);
   try {
-    return await withDebugger(tabId, owner, async (target) => {
-      await cdp(target, `${domain}.enable`, {}).catch(() => {});
+    const run = async () => {
+      await cdp(target, `${domain}.enable`, jsonValue(params.enableParams, {})).catch(() => {});
       await sleep(durationMs(params.duration, 5_000));
       return collector.events;
-    });
+    };
+    return persistent ? run() : withRawDebugger(target, owner, run);
   } finally {
-    eventCollectors.delete(tabId);
+    eventCollectors.delete(key);
   }
 }
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
+  const collector = eventCollectors.get(debuggeeKey(source));
+  if (collector && method.startsWith(`${collector.domain}.`)) collector.events.push({ method, params, source, at: new Date().toISOString() });
+
   const tabId = source.tabId;
   if (!tabId) return;
 
@@ -985,13 +1286,22 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   const scripts = scriptCollectors.get(tabId);
   if (scripts && method === "Debugger.scriptParsed") scripts.push(params);
 
-  const collector = eventCollectors.get(tabId);
-  if (collector && method.startsWith(`${collector.domain}.`)) {
-    collector.events.push({ method, params, at: new Date().toISOString() });
-  }
-
   const trace = traceCollectors.get(tabId);
   if (trace && method === "Tracing.tracingComplete") trace.resolve(params.stream);
+
+  const screencast = screencastCollectors.get(tabId);
+  if (screencast && method === "Page.screencastFrame") {
+    screencast.frames.push({ data: params.data, metadata: params.metadata, sessionId: params.sessionId });
+    cdp({ tabId }, "Page.screencastFrameAck", { sessionId: params.sessionId }).catch(() => {});
+  }
+});
+
+chrome.debugger.onDetach.addListener((source) => {
+  if (source.tabId !== undefined) emulationOwners.delete(source.tabId);
+  for (const [id, session] of manualCdpSessions) {
+    if (debuggeeKey(session.target) === debuggeeKey(source)) manualCdpSessions.delete(id);
+  }
+  scheduleStatusBroadcast();
 });
 
 async function handleAttachedTarget(capture, params) {

@@ -1,6 +1,6 @@
 ---
 name: chrome-bridge
-description: Inspect, debug, and operate the user's existing signed-in Chrome session through the local chrome-bridge JSON CLI, without MCP or a separate automation profile. Use when an agent needs live page DOM, accessibility, styles, scripts, resources, console, network requests or complete bodies, WebSocket frames, storage, cookies, targets, screenshots, performance data, browsing data, JavaScript evaluation, raw CDP access, or page interaction while developing websites and Chrome extensions.
+description: Inspect, debug, and fully operate the user's existing signed-in Chrome session through the local chrome-bridge JSON CLI, without MCP or a separate automation profile. Use for live DOM, accessibility, styles, scripts, resources, console, network bodies, WebSockets, storage, cookies, targets, screenshots, screencasts, performance, emulation, dialogs, file upload, real mouse and keyboard input, extension management, browser APIs, JavaScript evaluation, or stateful raw CDP while developing websites and Chrome extensions.
 ---
 
 # Chrome Bridge
@@ -45,6 +45,8 @@ chrome-bridge visible-text --tab=3
 chrome-bridge styles --tab=3 --selector='.target'
 chrome-bridge targets --tab=3
 chrome-bridge screenshot --tab=3 --file=/tmp/page.png
+chrome-bridge screenshot --tab=3 --selector='.target' --file=/tmp/element.png
+chrome-bridge screencast --tab=3 --duration=5s --file=/tmp/frames.json
 ```
 
 Use `snapshot` for semantic element grounding, `dom` for serialized page code, `dom snapshot` for CDP layout/paint data, and `styles` for matched and computed CSS.
@@ -97,20 +99,47 @@ chrome-bridge cdp send --tab=3 --session-id=CHILD_SESSION --method=Runtime.getHe
 chrome-bridge cdp events --tab=3 --domain=Network --duration=10s
 ```
 
-Raw CDP accepts every domain Chrome exposes through `chrome.debugger`, including mutating commands and child-session routing.
+Use a persistent session when several CDP commands depend on prior state:
+
+```bash
+chrome-bridge cdp session-start --tab=3
+chrome-bridge cdp send --bridge-session=SESSION --method=Debugger.enable
+chrome-bridge cdp send --bridge-session=SESSION --method=Debugger.setBreakpointByUrl --params='{"lineNumber":10,"url":"https://example.com/app.js"}'
+chrome-bridge cdp events --bridge-session=SESSION --domain=Debugger --duration=30s
+chrome-bridge cdp session-stop --bridge-session=SESSION
+```
+
+Run `targets` without `--tab` to list page, iframe, worker, and extension targets, then replace `--tab=ID` with `--target=TARGET_ID` for raw CDP commands or persistent sessions. `--session-id=CHILD_SESSION` routes through a flat child target. Chrome Bridge forwards every syntactically valid method; Chrome itself rejects domains unavailable to the MV3 `chrome.debugger` API.
 
 ## Operate only when requested
 
 ```bash
 chrome-bridge eval --tab=3 'document.title'
 chrome-bridge click --tab=3 --selector='button.submit'
+chrome-bridge click --tab=3 --x=240 --y=180
+chrome-bridge hover --tab=3 --selector='.menu'
+chrome-bridge drag --tab=3 --from-selector='.card' --to-selector='.column'
 chrome-bridge type --tab=3 --selector='input[name=q]' --text='query'
+chrome-bridge type-text --tab=3 --text='text for the focused element'
+chrome-bridge press-key --tab=3 'Meta+A'
+chrome-bridge fill-form --tab=3 --elements='[{"selector":"#email","value":"me@example.com"}]'
+chrome-bridge upload-file --tab=3 --selector='input[type=file]' --file=/tmp/example.png
+chrome-bridge wait-for --tab=3 --selector='.loaded' --duration=30s
+chrome-bridge handle-dialog --tab=3 --action=accept --prompt-text='value'
+chrome-bridge resize --tab=3 --width=1280 --height=720
+chrome-bridge emulate --tab=3 --viewport=390x844x3 --mobile --cpu=4
+chrome-bridge emulate --tab=3 --latency=100 --download=200000 --upload=100000
+chrome-bridge emulate --tab=3 --clear
 chrome-bridge navigate --tab=3 --url='https://example.com'
+chrome-bridge new-tab 'https://example.com'
+chrome-bridge close-tab --tab=3
 chrome-bridge reload --tab=3
 ```
 
 Inspection, interaction, navigation, and side-effecting evaluation all run directly through the CLI.
 
-Browser-wide metadata is available with `history search`, `bookmarks tree`, `bookmarks search`, and `downloads search`. Large native-messaging payloads are chunked without truncation. Use `chrome-bridge audit` to inspect the local command log and `chrome-bridge detach --tab=ID` to end any attachment immediately.
+Browser-wide metadata is available with `history search`, `bookmarks tree`, `bookmarks search`, and `downloads search`. Use `extensions list` and `extension reload --extension=ID` while developing other unpacked extensions. Use `chrome call --api=NAMESPACE --method=METHOD --args='[...]'` as the raw escape hatch for any granted Chrome Extension API, for example `chrome call --api=windows --method=getAll --args='[{"populate":true}]'`.
+
+Large native-messaging payloads are chunked without truncation. Use `chrome-bridge audit` to inspect the local command log and `chrome-bridge detach --tab=ID` to end every attachment to a tab immediately.
 
 After changing the unpacked extension's manifest or service-worker code, reload Chrome Bridge at `chrome://extensions` before live testing. If a command reports that another debugger is attached, close DevTools or run `chrome-bridge detach --tab=ID`, then retry.
