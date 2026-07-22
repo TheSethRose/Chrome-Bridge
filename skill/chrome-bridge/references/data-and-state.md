@@ -16,11 +16,11 @@ Use this reference to find a result, choose the correct ID, and understand when 
 | Data | Location | Lifetime |
 |---|---|---|
 | Normal command result | JSON on stdout. | Until the caller or shell discards it. |
-| Result written with `--file` | The exact absolute path supplied by the agent. | Persistent until that file is changed or deleted. |
+| Result written with `--file` | The exact absolute path supplied by the agent; stdout returns its SHA-256, bytes, capture time, format, bridge version, tab ID, and URL. Page metadata is `null` when the command cannot supply it. | Persistent until that file is changed or deleted. |
 | Full CLI request and response log | Native-host runtime `logs/` directory as `<command-id>.request.json` and `<command-id>.response.json`. | Persistent until **Clear logs** is clicked or the native host receives `clearLogs`. |
 | Side-panel command list | `chrome.storage.local` audit log. | Latest 25 entries; **Clear logs** removes it. It stores metadata, not full payloads. |
 | Expanded/copyable side-panel payload | Streamed on demand from the native-host `logs/` files. | Same lifetime as the retained log files. |
-| Active capture, CDP session, emulation, and running-command state | Extension service-worker memory and the live status payload. | Until explicitly stopped, detached, tab removal/navigation cleanup, extension reload, or service-worker termination. |
+| Active capture, CDP session, emulation, and running-command state | Extension service-worker memory and the live status payload. | Until explicitly stopped, detached, tab removal, extension reload, or service-worker termination. |
 | Request/response queue files | Native-host runtime `requests/` and `responses/`. | Requests are removed after forwarding; responses are removed after the waiting CLI consumes them. Do not use these as an archive. |
 
 The runtime root is:
@@ -61,6 +61,7 @@ These IDs are not interchangeable:
 | Identifier | Comes from | Used by | Meaning |
 |---|---|---|---|
 | Tab ID | `list-tabs` | Most page commands via `--tab` | Chrome's stable identifier for an open tab. |
+| Named tab | `tab name --tab=ID --name=NAME` | Most page commands via `--tab=NAME` | A local alias stored by Chrome Bridge; one tab keeps one current alias. If the old ID disappears, it rebinds only when exactly one open tab has the saved URL, otherwise the command fails and asks for reassignment. |
 | Target ID | `targets` | `cdp send`, `cdp events`, `cdp session-start` via `--target` | A page, iframe, worker, service worker, or extension debuggee. It may change after reload/restart. |
 | Bridge session ID | `cdp session-start` | Raw CDP via `--bridge-session` | Chrome Bridge's owner for a persistent root debugger attachment. |
 | Child CDP session ID | `Target.attachedToTarget` event | Raw CDP via `--session-id` | CDP's flat route from the attached root into a child target. |
@@ -79,17 +80,19 @@ These IDs are not interchangeable:
 4. With `--bodies`, the bridge fetches bodies as requests finish and stores them inside the final records.
 5. `network stop` waits for pending body reads, returns the final snapshot or HAR, removes the capture from memory, and detaches its debugger owner.
 
-Starting a capture does not include requests that happened before attachment. For an initial page load, start the capture, reload, wait for the page, then stop. If a body was neither fetched before stop nor retained with `--bodies`, it is not available afterward from that capture.
+Starting a capture does not include requests that happened before attachment. For an initial page load, use `network capture --reload --wait=network-idle --bodies`; the result states whether reload happened after attachment, how many bodies were retained, and how many body reads failed. If a body was neither fetched before stop nor retained with `--bodies`, it is not available afterward from that capture. A `network start --ttl=5m` lease stops and removes the capture at expiry, so call `network stop` before then when its final records must be saved.
 
 ## Large results and Native Messaging
 
 Chrome imposes per-frame Native Messaging limits, so the bridge splits requests and responses into frames and reassembles them. It does not apply a total payload cap or redact data.
 
-Use `--file` for DOM dumps, network captures with bodies, storage exports, screenshots, MHTML, CPU profiles, and traces. The CLI writes:
+Use `--file` for DOM dumps, network captures with bodies, storage exports, screenshots, MHTML, CPU profiles, and traces. JSON shaping happens before JSON is written, so the receipt hash and byte count describe the shaped artifact. The CLI writes:
 
 - Screenshot: decoded PNG or JPEG bytes.
 - Performance trace and MHTML: raw returned data.
-- Every other command: formatted JSON containing the complete result.
+- Every other command: JSON in the requested pretty, compact, or NDJSON serialization.
+
+Do not combine output-shaping flags with `--file` for screenshots, performance traces, or MHTML; the CLI rejects that combination instead of corrupting the raw artifact. Chrome Bridge does not redact artifacts or retained logs, so treat captures from authenticated pages as sensitive data.
 
 If a terminal, shell integration, or agent context shows only part of stdout, inspect the file written by `--file` or the retained native-host response log. Do not rerun a large capture merely because the display layer clipped it.
 
@@ -97,9 +100,9 @@ If a terminal, shell integration, or agent context shows only part of stdout, in
 
 | State | Starts with | Normal cleanup |
 |---|---|---|
-| Network capture | `network start` | `network stop --session=...` |
-| Persistent CDP | `cdp session-start` | `cdp session-stop --bridge-session=...` |
-| Persistent emulation/resize | `emulate` or `resize` | `emulate --clear` |
+| Network capture | `network start` | `network stop --session=...`, or automatic cleanup with `--ttl` |
+| Persistent CDP | `cdp session-start` | `cdp session-stop --bridge-session=...`, or automatic cleanup with `--ttl` |
+| Persistent emulation/resize | `emulate` or `resize` | `emulate --clear`, or automatic reset with `--ttl` |
 | Timed console, network, screencast, profile, trace, or CDP events | Its timed command | Ends automatically after the duration. |
 
-Use `status` to see active owners. Use `detach --tab=ID` when targeted cleanup cannot complete; it removes every Chrome Bridge debugger owner for that tab. Reloading Chrome Bridge also drops in-memory state, but use explicit cleanup so the browser returns to a known state before the task ends.
+TTL is cleanup, not a tab lock or command lease, so coordinated agents can still share a tab. Use `status` to see active owners. Use `detach --tab=ID` when targeted cleanup cannot complete; it removes every Chrome Bridge debugger owner for that tab. Reloading Chrome Bridge also drops in-memory state, but use explicit cleanup so the browser returns to a known state before the task ends.

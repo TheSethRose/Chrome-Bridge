@@ -5,7 +5,6 @@ const attachments = document.querySelector("#attachments");
 const requests = document.querySelector("#requests");
 const captures = document.querySelector("#captures");
 const captureList = document.querySelector("#capture-list");
-const activitySummary = document.querySelector("#activity-summary");
 const commands = document.querySelector("#commands");
 const clearLogs = document.querySelector("#clear-logs");
 const commandSearch = document.querySelector("#command-search");
@@ -436,7 +435,6 @@ function render(status) {
   attachments.textContent = String((status.attachedTabs || []).length);
   requests.textContent = Number(stats.networkRequests || 0).toLocaleString();
   captures.textContent = String(activeCaptures.length);
-  activitySummary.textContent = `${online ? "Live" : "Extension-local"} · ${Number(stats.commandsCompleted || 0).toLocaleString()} completed · ${Number(stats.commandsFailed || 0).toLocaleString()} failed · ${formatBytes(stats.networkBytes || 0)} captured · ${Number(stats.webSocketFrames || 0).toLocaleString()} WebSocket frames`;
 
   const liveItems = activeCommands.map((command) => {
     const item = document.createElement("div");

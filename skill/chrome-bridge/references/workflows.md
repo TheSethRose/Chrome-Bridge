@@ -5,10 +5,12 @@ Use these combinations when one command is insufficient. Replace IDs and selecto
 ## Inspect, act, and verify
 
 ```bash
-chrome-bridge eval --tab=3 '({title:document.title,controls:[...document.querySelectorAll("button,input,[contenteditable=true]")].map(el=>({tag:el.tagName,label:el.getAttribute("aria-label"),testid:el.getAttribute("data-testid"),text:el.innerText||el.value})).slice(0,50)})'
-chrome-bridge type --tab=3 --selector='[contenteditable=true]' --text='Approved text'
-chrome-bridge click --tab=3 --selector='button[type=submit]'
-chrome-bridge wait-for --tab=3 --selector='.success' --duration=15s
+chrome-bridge capabilities --tab=3
+chrome-bridge locate --tab=3 --role=button --name='Save changes'
+chrome-bridge snapshot --tab=3 --compact --file=/tmp/before.json
+chrome-bridge click --tab=3 --backend-node-id=NODE_ID --wait-for-selector='.success' --wait-timeout=15s
+chrome-bridge snapshot --tab=3 --compact --file=/tmp/after.json
+chrome-bridge snapshot diff --before=/tmp/before.json --after=/tmp/after.json --compact
 ```
 
 Prefer a stable `data-testid`, accessible label, name, or semantic selector. Verify an external action from a success toast, cleared composer, changed URL, resulting DOM, or captured request.
@@ -16,11 +18,10 @@ Prefer a stable `data-testid`, accessible label, name, or semantic selector. Ver
 ## Discover a private API during a real action
 
 ```bash
-chrome-bridge network start --tab=3 --bodies --url-filter='/api/'
-chrome-bridge click --tab=3 --selector='button.save'
-chrome-bridge wait-for --tab=3 --text='Saved' --duration=15s
-chrome-bridge network tail --tab=3 --session=SESSION
-chrome-bridge network get-body --tab=3 --session=SESSION --request=REQUEST_KEY
+chrome-bridge network start --tab=3 --bodies --url-filter='/api/' --ttl=5m
+chrome-bridge click --tab=3 --selector='button.save' --wait-for-selector='.saved' --wait-timeout=15s
+chrome-bridge network tail --tab=3 --session=SESSION --errors-only
+chrome-bridge network get-body --tab=3 --session=SESSION --request=REQUEST_KEY --pretty
 chrome-bridge network stop --tab=3 --session=SESSION --file=/tmp/save-flow.json
 ```
 
@@ -29,10 +30,7 @@ Start the capture before the triggering action. Inspect request method, URL, hea
 ## Investigate an initial page load
 
 ```bash
-chrome-bridge network start --tab=3 --bodies
-chrome-bridge reload --tab=3
-chrome-bridge wait-for --tab=3 --expression='document.readyState === "complete"' --duration=30s
-chrome-bridge network stop --tab=3 --session=SESSION --file=/tmp/page-load.json
+chrome-bridge network capture --tab=3 --reload --wait=network-idle --duration=30s --bodies --file=/tmp/page-load.json
 chrome-bridge console capture --tab=3 --duration=2s --file=/tmp/console.json
 ```
 
@@ -52,7 +50,7 @@ Use `styles` for the element's computed and matched CSS. Use script and resource
 ## Debug with a persistent CDP session
 
 ```bash
-chrome-bridge cdp session-start --tab=3
+chrome-bridge cdp session-start --tab=3 --ttl=5m
 chrome-bridge cdp send --bridge-session=SESSION --method=Runtime.enable
 chrome-bridge cdp send --bridge-session=SESSION --method=Debugger.enable
 chrome-bridge cdp send --bridge-session=SESSION --method=Debugger.setPauseOnExceptions --params='{"state":"all"}'
@@ -66,7 +64,7 @@ Keep the session ID separate from a network capture session and a CDP child `ses
 
 ```bash
 chrome-bridge targets --file=/tmp/targets.json
-chrome-bridge cdp session-start --target=TARGET_ID
+chrome-bridge cdp session-start --target=TARGET_ID --ttl=5m
 chrome-bridge cdp send --bridge-session=SESSION --method=Runtime.enable
 chrome-bridge cdp send --bridge-session=SESSION --method=Runtime.evaluate --params='{"expression":"self.location.href","returnByValue":true}'
 chrome-bridge cdp session-stop --bridge-session=SESSION
@@ -77,9 +75,8 @@ For a child discovered through `Target.attachedToTarget`, keep the tab or root t
 ## Reproduce mobile, slow-network, or dark-mode behavior
 
 ```bash
-chrome-bridge emulate --tab=3 --viewport=390x844x3 --mobile --cpu=4 --latency=100 --download=200000 --upload=100000 --color-scheme=dark
-chrome-bridge reload --tab=3
-chrome-bridge wait-for --tab=3 --expression='document.readyState === "complete"' --duration=30s
+chrome-bridge emulate --tab=3 --viewport=390x844x3 --mobile --cpu=4 --latency=100 --download=200000 --upload=100000 --color-scheme=dark --ttl=10m
+chrome-bridge reload --tab=3 --wait=load --wait-timeout=30s
 chrome-bridge screenshot --tab=3 --file=/tmp/mobile-dark.png
 chrome-bridge emulate --tab=3 --clear
 ```

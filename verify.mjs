@@ -7,10 +7,12 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { normalizeCommand, parseArguments, parseDuration } from "./bin/chrome-bridge.mjs";
 import { decodeNativeMessages, encodeNativeMessage } from "./native-host/host.mjs";
+import { COMMANDS, schema } from "./shared/commands.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const execFile = promisify(execFileCallback);
 const read = (file) => readFile(path.join(root, file), "utf8");
+const packageJson = JSON.parse(await read("package.json"));
 const manifest = JSON.parse(await read("extension/manifest.json"));
 const background = await read("extension/background.js");
 const skill = await read("skill/chrome-bridge/SKILL.md");
@@ -60,6 +62,9 @@ assert.doesNotMatch(
   /chrome\.tabs\.onUpdated\.addListener\([\s\S]{0,300}detachAll\(tabId\)/,
   "same-tab navigation must not detach an in-flight command",
 );
+const waitForPageSource = background.match(/async function waitForPage[\s\S]*?(?=\nasync function handleDialog)/)?.[0] || "";
+assert.match(waitForPageSource, /chrome\.tabs\.get\(tabId\)/, "wait-for must not inspect the previous document during navigation");
+assert.match(waitForPageSource, /Detached while handling command\./, "wait-for must recover when navigation replaces its debugger target");
 assert.match(sidepanelScript, /chrome\.runtime\.onMessage/);
 assert.match(sidepanelScript, /document\.createElement\("details"\)/);
 assert.match(sidepanelScript, /navigator\.clipboard\.writeText/);
@@ -76,7 +81,7 @@ assert.match(sidepanelHtml, /id="clear-logs"/);
 for (const id of ["reconnect", "command-search", "status-filter", "tab-filter", "log-summary"]) {
   assert.match(sidepanelHtml, new RegExp(`id="${id}"`), `missing log control ${id}`);
 }
-for (const id of ["running", "attachments", "requests", "captures", "activity-summary"]) {
+for (const id of ["running", "attachments", "requests", "captures"]) {
   assert.match(sidepanelHtml, new RegExp(`id="${id}"`), `missing live activity field ${id}`);
 }
 assert.match(sidepanelScript, /status\.activeCommands/);
@@ -118,8 +123,8 @@ assert.match(linkedinSkillMetadata, /\$linkedin-chrome-bridge/);
 assert.match(skillCommands, /Use it for/);
 assert.match(skillCommands, /What it returns or changes/);
 for (const documented of [
-  "status", "list-tabs", "new-tab", "close-tab", "activate-tab", "navigate", "reload", "go-back", "go-forward", "detach", "audit",
-  "snapshot", "dom", "dom snapshot", "visible-text", "styles", "screenshot", "screencast", "eval",
+  "status", "doctor", "inspectability", "capabilities", "list-tabs", "tab name", "new-tab", "close-tab", "activate-tab", "navigate", "reload", "go-back", "go-forward", "detach", "audit",
+  "snapshot", "snapshot diff", "locate", "watch", "dom", "dom snapshot", "visible-text", "styles", "screenshot", "screencast", "eval",
   "click", "hover", "drag", "type", "type-text", "press-key", "fill-form", "upload-file", "wait-for", "handle-dialog",
   "network capture", "network start", "network tail", "network get-body", "network stop", "network export-har", "console capture",
   "scripts list", "scripts get", "resources tree", "resources get", "page mhtml", "cookies", "storage", "targets",
@@ -141,12 +146,25 @@ for (const command of [
   "dom-snapshot", "performance-trace", "history-search", "bookmarks-tree", "downloads-search", "cdp-send",
   "new-tab", "close-tab", "go-forward", "hover", "drag", "press-key", "fill-form", "upload-file",
   "wait-for", "handle-dialog", "resize", "emulate", "screencast", "cdp-session-start", "cdp-session-stop",
+  "inspectability", "doctor",
 ]) {
   assert.ok(background.includes(`case "${command}"`), `missing command handler ${command}`);
 }
 assert.match(background, /Target\.setAutoAttach/);
 assert.match(background, /manualCdpSessions/);
 assert.match(background, /chrome\[namespace\]/);
+assert.match(background, /backendNodePoint/);
+assert.match(background, /sideEffectMayHaveOccurred/);
+assert.match(background, /initialLoadCaptured/);
+assert.match(background, /waitForNetworkIdle/);
+assert.match(background, /async function inspectability/);
+assert.match(background, /async function doctor/);
+assert.match(background, /function presentNetwork/);
+assert.match(background, /function scheduleEmulationCleanup/);
+assert.match(background, /stopNetwork\(capture\)\.catch/);
+assert.match(background, /stopCdpSession\(id\)\.catch/);
+assert.match(background, /params\.valueOnly/);
+assert.match(background, /params\.maxNodes/);
 assert.doesNotMatch(background, /ALLOWED_CDP_DOMAINS/, "raw CDP must let Chrome decide protocol support");
 
 assert.deepEqual(parseArguments(["network", "capture", "--tab=3", "--bodies"]), {
@@ -154,22 +172,101 @@ assert.deepEqual(parseArguments(["network", "capture", "--tab=3", "--bodies"]), 
   options: { tab: "3", bodies: true },
 });
 assert.equal(parseDuration("1.5s"), 1500);
-assert.deepEqual(normalizeCommand(parseArguments(["network", "capture", "--duration=2s"])), {
+assert.equal(parseDuration("1h"), 3_600_000);
+assert.deepEqual(normalizeCommand(parseArguments(["network", "capture", "--tab=3", "--duration=2s"])), {
   command: "network-capture",
-  params: { duration: 2_000 },
+  params: { tab: 3, duration: 2_000 },
 });
 assert.deepEqual(normalizeCommand(parseArguments(["cdp", "session-start", "--target=worker-1"])), {
   command: "cdp-session-start",
   params: { target: "worker-1" },
 });
-assert.deepEqual(normalizeCommand(parseArguments(["press-key", "Meta+A"])), {
+assert.deepEqual(normalizeCommand(parseArguments(["press-key", "--tab=3", "Meta+A"])), {
   command: "press-key",
-  params: { key: "Meta+A" },
+  params: { tab: 3, key: "Meta+A" },
 });
 assert.deepEqual(normalizeCommand(parseArguments(["new-tab", "https://example.com", "--active=false"])), {
   command: "new-tab",
   params: { active: false, url: "https://example.com" },
 });
+assert.deepEqual(normalizeCommand(parseArguments(["click", "--tab=3", "--backend-node-id=456", "--wait-for-url=/analytics"])), {
+  command: "click",
+  params: { tab: 3, backendNodeId: 456, waitForUrl: "/analytics" },
+});
+assert.deepEqual(normalizeCommand(parseArguments(["console", "tail", "--tab=3", "--duration=1s"])), {
+  command: "console-capture",
+  params: { tab: 3, duration: 1_000 },
+});
+assert.deepEqual(normalizeCommand(parseArguments(["snapshot", "--tab=linkedin-profile", "--compact"])), {
+  command: "snapshot",
+  params: { tab: "linkedin-profile", compact: true },
+});
+assert.deepEqual(normalizeCommand(parseArguments(["watch", "--tab=3", "--request=*/graphql", "--duration=30s"])), {
+  command: "watch",
+  params: { tab: 3, request: "*/graphql", duration: 30_000 },
+});
+assert.throws(() => normalizeCommand(parseArguments(["click", "--tab=3"])), /click requires a target[\s\S]*--backend-node-id/);
+assert.throws(() => normalizeCommand(parseArguments(["reload"])), /requires an explicit --tab=ID/);
+assert.throws(() => normalizeCommand(parseArguments(["snapshot", "--max-node=10"])), /Did you mean --max-nodes/);
+assert.throws(() => normalizeCommand(parseArguments(["watch", "--tab=3", "--url-changes", "--selector=main"])), /exactly one/);
+assert.throws(() => normalizeCommand(parseArguments(["locate", "--tab=3"])), /requires --text, --role, or --name/);
+
+const commandSchema = schema();
+assert.equal(commandSchema.commands.length, COMMANDS.length);
+const catalogIds = new Set(COMMANDS.map((entry) => entry.id));
+for (const match of background.matchAll(/case "([^"]+)":/g)) assert.ok(catalogIds.has(match[1]), `handler ${match[1]} is missing from the command schema`);
+for (const entry of COMMANDS.filter((item) => !["help", "commands", "setup", "snapshot-diff"].includes(item.id))) assert.ok(background.includes(`"${entry.id}"`), `catalog command ${entry.id} is missing a handler`);
+for (const entry of commandSchema.commands) {
+  assert.ok(entry.syntax, `${entry.name} is missing syntax`);
+  assert.ok(entry.output, `${entry.name} is missing an output shape`);
+  assert.ok(entry.examples.length >= 2, `${entry.name} needs two examples`);
+  for (const [name, definition] of Object.entries(entry.arguments)) assert.ok(definition.type, `${entry.name} ${name} is missing a type`);
+}
+
+for (const args of [["snapshot", "--help"], ["eval", "--help"], ["network", "capture", "--help"]]) {
+  const { stdout } = await execFile(process.execPath, [path.join(root, "bin", "chrome-bridge.mjs"), ...args]);
+  const commandHelp = JSON.parse(stdout);
+  assert.ok(commandHelp.syntax);
+  assert.ok(commandHelp.requiredArguments);
+  assert.ok(commandHelp.optionalArguments);
+  assert.ok(commandHelp.examples.length >= 2);
+  assert.ok(commandHelp.output);
+}
+const { stdout: schemaOutput } = await execFile(process.execPath, [path.join(root, "bin", "chrome-bridge.mjs"), "commands", "--json"]);
+assert.equal(JSON.parse(schemaOutput).commands.length, COMMANDS.length);
+const diffDirectory = await mkdtemp(path.join(os.tmpdir(), "chrome-bridge-diff-test-"));
+const beforeSnapshot = path.join(diffDirectory, "before.json");
+const afterSnapshot = path.join(diffDirectory, "after.json");
+const diffArtifact = path.join(diffDirectory, "diff.json");
+await Promise.all([
+  writeFile(beforeSnapshot, JSON.stringify({ nodes: [{ backendDOMNodeId: 1, name: "Before" }, { backendDOMNodeId: 2, name: "Removed" }] })),
+  writeFile(afterSnapshot, JSON.stringify({ nodes: [{ backendDOMNodeId: 1, name: "After" }, { backendDOMNodeId: 3, name: "Added" }] })),
+]);
+const { stdout: diffOutput } = await execFile(process.execPath, [path.join(root, "bin", "chrome-bridge.mjs"), "snapshot", "diff", `--before=${beforeSnapshot}`, `--after=${afterSnapshot}`, "--fields=counts", "--compact"]);
+assert.deepEqual(JSON.parse(diffOutput), { counts: { added: 1, removed: 1, changed: 1 } });
+const { stdout: receiptOutput } = await execFile(process.execPath, [path.join(root, "bin", "chrome-bridge.mjs"), "snapshot", "diff", `--before=${beforeSnapshot}`, `--after=${afterSnapshot}`, `--file=${diffArtifact}`]);
+const receipt = JSON.parse(receiptOutput);
+assert.equal(receipt.path, diffArtifact);
+assert.match(receipt.sha256, /^[a-f0-9]{64}$/);
+assert.equal(receipt.bytes, (await readFile(diffArtifact)).length);
+assert.equal(receipt.chromeBridgeVersion, packageJson.version);
+await rm(diffDirectory, { recursive: true, force: true });
+await assert.rejects(
+  execFile(process.execPath, [path.join(root, "bin", "chrome-bridge.mjs"), "dom-summary"]),
+  (error) => /Did you mean: dom snapshot/.test(error.stderr),
+);
+const doctorHome = await mkdtemp(path.join(os.tmpdir(), "chrome-bridge-doctor-test-"));
+const { stdout: doctorOutput } = await execFile(process.execPath, [path.join(root, "bin", "chrome-bridge.mjs"), "doctor"], { env: { ...process.env, CHROME_BRIDGE_HOME: doctorHome } });
+assert.deepEqual(JSON.parse(doctorOutput).checks[0], {
+  name: "bridge-request",
+  ok: false,
+  detail: "Chrome Bridge is not set up; run chrome-bridge setup",
+  recovery: "Run chrome-bridge setup, load or reload the unpacked extension, then retry doctor.",
+});
+await rm(doctorHome, { recursive: true, force: true });
+assert.match(cliSource, /normalized\.command === "upload-file" \? undefined : normalized\.params\.file/, "upload input must not be reused as an output path");
+assert.match(await read("native-host/host.mjs"), new RegExp(`HOST_VERSION = "${manifest.version}"`), "native host and extension versions must stay aligned");
+assert.equal(packageJson.version, manifest.version, "CLI and extension versions must stay aligned");
 
 const framed = encodeNativeMessage({ hello: "world" });
 const decoded = [];

@@ -1,8 +1,11 @@
 const HOST_NAME = "dev.sethrose.chrome_bridge";
 const PROTOCOL_VERSION = "1.3";
+const REQUIRED_PERMISSIONS = ["bookmarks", "cookies", "debugger", "downloads", "history", "management", "nativeMessaging", "sessions", "sidePanel", "storage", "tabGroups", "tabs", "topSites", "webNavigation"];
+const REQUIRED_ORIGINS = ["<all_urls>"];
 
 let nativePort;
 let hostOnline = false;
+let hostVersion;
 let hasConnected = false;
 let reconnectTimer;
 let reconnectDelay = 1_000;
@@ -29,6 +32,7 @@ const eventCollectors = new Map();
 const traceCollectors = new Map();
 const screencastCollectors = new Map();
 const emulationOwners = new Map();
+const emulationTimers = new Map();
 const dragResolvers = new Map();
 const manualCdpSessions = new Map();
 const requestChunks = new Map();
@@ -47,14 +51,54 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function commandError(message, details) {
+  const error = new Error(message);
+  error.details = details;
+  return error;
+}
+
+function debuggerOwnership(tabId) {
+  const owners = [...(attachedOwners.get(tabId) || [])];
+  const networkOwner = owners.find((owner) => owner.startsWith("network:"));
+  const sessionOwner = owners.find((owner) => owner.startsWith("cdp-session:"));
+  if (networkOwner) {
+    const sessionId = networkOwner.slice("network:".length);
+    return { blockedBy: "network-capture", sessionId, recovery: `chrome-bridge network stop --tab=${tabId} --session=${sessionId}` };
+  }
+  if (sessionOwner) {
+    const sessionId = sessionOwner.slice("cdp-session:".length);
+    return { blockedBy: "cdp-session", sessionId, recovery: `chrome-bridge cdp session-stop --bridge-session=${sessionId}` };
+  }
+  if (owners.some((owner) => owner.startsWith("emulation:"))) return { blockedBy: "emulation", recovery: `chrome-bridge emulate --tab=${tabId} --clear` };
+  return owners.length ? { blockedBy: "chrome-bridge-command", owners } : null;
+}
+
 async function resolveTab(tabId) {
-  if (tabId !== undefined && tabId !== null && tabId !== "") return chrome.tabs.get(Number(tabId));
+  if (tabId !== undefined && tabId !== null && tabId !== "") {
+    if (/^\d+$/.test(String(tabId))) return chrome.tabs.get(Number(tabId));
+    const { tabNames = {} } = await chrome.storage.local.get("tabNames");
+    const saved = tabNames[String(tabId)];
+    if (!saved) throw new Error(`Unknown tab name: ${tabId}`);
+    const current = await chrome.tabs.get(saved.tabId).catch(() => null);
+    if (current) return current;
+    const matches = (await chrome.tabs.query({})).filter((tab) => tab.url === saved.url);
+    if (matches.length !== 1) throw new Error(`Named tab ${tabId} is no longer available; assign the name again`);
+    tabNames[String(tabId)] = { ...saved, tabId: matches[0].id };
+    await chrome.storage.local.set({ tabNames });
+    return matches[0];
+  }
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) throw new Error("No active tab found");
   return tab;
 }
 
 async function attach(tabId, owner) {
+  const access = tabAccess(await chrome.tabs.get(tabId));
+  if (!access.inspectable) throw commandError(access.reason, {
+    scheme: access.scheme,
+    owningExtensionId: access.owningExtensionId,
+    recovery: access.httpPageWouldBeInspectable ? `Return to an http(s) page, for example with: chrome-bridge go-back --tab=${tabId} --wait=load` : null,
+  });
   const state = attachedOwners.get(tabId);
   if (state) {
     state.add(owner);
@@ -62,7 +106,10 @@ async function attach(tabId, owner) {
   }
 
   const target = (await chrome.debugger.getTargets()).find((candidate) => candidate.tabId === tabId && candidate.attached);
-  if (target) throw new Error(`Tab ${tabId} is already attached to DevTools or another debugger client`);
+  if (target) throw commandError(`Tab ${tabId} is already attached to DevTools or another debugger client`, {
+    blockedBy: "external-debugger",
+    recovery: "Close DevTools or stop the other debugger client for this tab, then retry.",
+  });
   await chrome.debugger.attach({ tabId }, PROTOCOL_VERSION);
   attachedOwners.set(tabId, new Set([owner]));
   activity.debuggerAttaches += 1;
@@ -92,8 +139,13 @@ async function detachAll(tabId) {
   scriptCollectors.delete(tabId);
   eventCollectors.delete(`tab:${tabId}`);
   emulationOwners.delete(tabId);
+  clearTimeout(emulationTimers.get(tabId));
+  emulationTimers.delete(tabId);
   for (const [id, session] of manualCdpSessions) {
-    if (session.target.tabId === tabId) manualCdpSessions.delete(id);
+    if (session.target.tabId === tabId) {
+      clearTimeout(session.timer);
+      manualCdpSessions.delete(id);
+    }
   }
   await chrome.debugger.detach({ tabId }).catch(() => {});
 }
@@ -177,6 +229,7 @@ function reconnectHost() {
 async function handleNativeMessage(message) {
   if (message?.type === "helloResult") {
     hostOnline = Boolean(message.ok);
+    hostVersion = message.version || null;
     hasConnected ||= hostOnline;
     if (hostOnline) reconnectDelay = 1_000;
     scheduleStatusBroadcast();
@@ -209,7 +262,8 @@ async function executeAndRespond(id, command, params) {
   activeCommands.set(id, {
     id,
     command,
-    tabId: params.tab === undefined ? undefined : Number(params.tab),
+    tabId: params.tab === undefined || !/^\d+$/.test(String(params.tab)) ? undefined : Number(params.tab),
+    tabName: params.tab === undefined || /^\d+$/.test(String(params.tab)) ? undefined : String(params.tab),
     targetId: params.target,
     startedAt,
   });
@@ -222,7 +276,7 @@ async function executeAndRespond(id, command, params) {
     sendChunkedResponse(id, { ok: true, result, completedAt: Date.now() });
   } catch (error) {
     activity.commandsFailed += 1;
-    sendChunkedResponse(id, { ok: false, error: errorMessage(error), completedAt: Date.now() });
+    sendChunkedResponse(id, { ok: false, error: errorMessage(error), details: error?.details, completedAt: Date.now() });
   } finally {
     activeCommands.delete(id);
     scheduleStatusBroadcast();
@@ -255,6 +309,7 @@ async function statusSnapshot() {
       tabId: capture.tabId,
       tabTitle: capture.tabTitle,
       startedAt: new Date(capture.startedAt).toISOString(),
+      expiresAt: capture.expiresAt ? new Date(capture.expiresAt).toISOString() : null,
       requests: capture.requests.size,
       webSocketFrames: capture.webSockets.length,
     })),
@@ -262,6 +317,7 @@ async function statusSnapshot() {
       session: session.id,
       target: session.target,
       startedAt: new Date(session.startedAt).toISOString(),
+      expiresAt: session.ttlMs === null ? null : new Date(session.startedAt + session.ttlMs).toISOString(),
     })),
     emulatedTabs: [...emulationOwners.keys()],
     activity: { ...activity },
@@ -271,6 +327,11 @@ async function statusSnapshot() {
     bridgeOnline: hostOnline,
     nativeConnected: Boolean(nativePort),
     connectionState,
+    versions: {
+      extension: chrome.runtime.getManifest().version,
+      nativeHost: hostVersion || null,
+      protocol: PROTOCOL_VERSION,
+    },
     ...live,
     recentCommands: auditLog.slice(-25).reverse(),
   };
@@ -364,7 +425,19 @@ async function executeCommand(command, params, requestId) {
     }
     if (command === "audit") {
       const { auditLog = [] } = await chrome.storage.local.get("auditLog");
-      return auditLog.slice().reverse();
+      const cutoff = params.since === undefined ? 0 : Date.now() - Number(params.since);
+      const filtered = auditLog.filter((entry) => (
+        (!params.status || entry.status === params.status)
+        && (!params.command || entry.command === params.command)
+        && (!cutoff || entry.completedAt >= cutoff)
+      )).reverse();
+      if (!params.summary) return filtered;
+      const countBy = (key) => filtered.reduce((counts, entry) => ({ ...counts, [entry[key]]: (counts[entry[key]] || 0) + 1 }), {});
+      return {
+        total: filtered.length,
+        byStatus: countBy("status"),
+        byCommand: countBy("command"),
+      };
     }
 
     const targetOnlyCommand = command === "cdp-session-stop"
@@ -384,6 +457,9 @@ async function executeCommand(command, params, requestId) {
       case "activate-tab":
         result = await chrome.tabs.update(tab.id, { active: true });
         break;
+      case "tab-name":
+        result = await nameTab(tab, params.name);
+        break;
       case "new-tab":
         result = await chrome.tabs.create({ url: navigableUrl(params.url || "about:blank"), active: params.active !== false });
         break;
@@ -392,22 +468,43 @@ async function executeCommand(command, params, requestId) {
         result = { closed: true, tabId: tab.id };
         break;
       case "navigate":
-        result = await chrome.tabs.update(tab.id, { url: navigableUrl(params.url) });
+        result = await navigateAndWait(tab, owner, params, () => chrome.tabs.update(tab.id, { url: navigableUrl(params.url) }));
         break;
       case "reload":
-        await chrome.tabs.reload(tab.id);
-        result = { reloaded: true, tabId: tab.id };
+        result = await navigateAndWait(tab, owner, params, async () => {
+          await chrome.tabs.reload(tab.id);
+          return { reloaded: true, tabId: tab.id };
+        });
         break;
       case "go-back":
-        await chrome.tabs.goBack(tab.id);
-        result = { navigated: "back", tabId: tab.id };
+        result = await navigateAndWait(tab, owner, params, async () => {
+          await chrome.tabs.goBack(tab.id);
+          return { navigated: "back", tabId: tab.id };
+        });
         break;
       case "go-forward":
-        await chrome.tabs.goForward(tab.id);
-        result = { navigated: "forward", tabId: tab.id };
+        result = await navigateAndWait(tab, owner, params, async () => {
+          await chrome.tabs.goForward(tab.id);
+          return { navigated: "forward", tabId: tab.id };
+        });
+        break;
+      case "inspectability":
+        result = await inspectability(tab);
+        break;
+      case "capabilities":
+        result = await pageCapabilities(tab);
+        break;
+      case "doctor":
+        result = await doctor(tab, owner, params);
         break;
       case "snapshot":
         result = await accessibilitySnapshot(tab.id, owner, params);
+        break;
+      case "locate":
+        result = await locateElements(tab.id, owner, params);
+        break;
+      case "watch":
+        result = await watchPage(tab, owner, params);
         break;
       case "dom":
         result = await pageDom(tab.id, owner, params);
@@ -467,7 +564,7 @@ async function executeCommand(command, params, requestId) {
         result = await startNetwork(tab.id, params);
         break;
       case "network-tail":
-        result = networkSnapshot(findCapture(params.session, tab.id));
+        result = presentNetwork(networkSnapshot(findCapture(params.session, tab.id)), params);
         break;
       case "network-stop":
         result = await stopNetwork(findCapture(params.session, tab.id), Boolean(params.har));
@@ -569,14 +666,29 @@ async function executeCommand(command, params, requestId) {
 }
 
 async function listTabs() {
+  const { tabNames = {} } = await chrome.storage.local.get("tabNames");
+  const namesById = new Map(Object.entries(tabNames).map(([name, saved]) => [saved.tabId, name]));
   return (await chrome.tabs.query({})).map((tab) => ({
     id: tab.id,
+    name: namesById.get(tab.id),
     windowId: tab.windowId,
     active: tab.active,
     title: tab.title,
     url: tab.url || "",
     attached: Boolean(tab.id && attachedOwners.has(tab.id)),
   }));
+}
+
+async function nameTab(tab, nameValue) {
+  const name = String(nameValue || "");
+  if (!/^[a-zA-Z0-9._-]+$/.test(name)) throw new Error("Tab names may contain only letters, numbers, dot, underscore, and hyphen");
+  const { tabNames = {} } = await chrome.storage.local.get("tabNames");
+  for (const [existingName, saved] of Object.entries(tabNames)) {
+    if (existingName !== name && saved.tabId === tab.id) delete tabNames[existingName];
+  }
+  tabNames[name] = { tabId: tab.id, url: tab.url || "", title: tab.title || "" };
+  await chrome.storage.local.set({ tabNames });
+  return { name, ...tabNames[name] };
 }
 
 async function rawChromeApi(params) {
@@ -605,30 +717,307 @@ function navigableUrl(value) {
   return url;
 }
 
+async function waitForAction(tabId, owner, params) {
+  if (!params.wait && !params.waitForUrl && !params.waitForSelector) return null;
+  const timeout = durationMs(params.waitTimeout, 30_000);
+  const deadline = Date.now() + timeout;
+  while (Date.now() <= deadline) {
+    const tab = await chrome.tabs.get(tabId);
+    const loadMatched = params.wait !== "load" || tab.status === "complete";
+    const urlMatched = !params.waitForUrl || String(tab.url || "").includes(String(params.waitForUrl));
+    if (loadMatched && urlMatched) break;
+    await sleep(100);
+  }
+  const current = await chrome.tabs.get(tabId);
+  if (params.wait === "load" && current.status !== "complete") throw new Error(`Page did not finish loading within ${timeout}ms`);
+  if (params.waitForUrl && !String(current.url || "").includes(String(params.waitForUrl))) throw new Error(`URL did not contain ${params.waitForUrl} within ${timeout}ms`);
+  let selector;
+  if (params.waitForSelector) {
+    selector = await waitForPage(tabId, owner, { selector: params.waitForSelector, duration: Math.max(0, deadline - Date.now()) });
+  }
+  return { matched: true, elapsedMs: timeout - Math.max(0, deadline - Date.now()), selector };
+}
+
+async function observeTab(tabId, beforeUrl, duration = 1_500) {
+  const deadline = Date.now() + duration;
+  let current = await chrome.tabs.get(tabId);
+  let stableSince = Date.now();
+  let last = `${current.url}|${current.status}`;
+  while (Date.now() < deadline) {
+    await sleep(100);
+    current = await chrome.tabs.get(tabId);
+    const next = `${current.url}|${current.status}`;
+    if (next !== last) {
+      last = next;
+      stableSince = Date.now();
+    }
+    if (current.status === "complete" && Date.now() - stableSince >= 250 && (current.url !== beforeUrl || Date.now() + 500 >= deadline)) break;
+  }
+  return current;
+}
+
+async function navigateAndWait(tab, owner, params, action) {
+  const result = await action();
+  const waitResult = await waitForAction(tab.id, owner, params);
+  const current = waitResult ? await chrome.tabs.get(tab.id) : await observeTab(tab.id, tab.url, 500);
+  return { ...result, wait: waitResult || undefined, finalUrl: current.url || "", title: current.title || "" };
+}
+
+function tabAccess(tab) {
+  let parsed;
+  try { parsed = new URL(tab.url || "about:blank"); } catch { parsed = new URL("about:blank"); }
+  const scheme = parsed.protocol.replace(/:$/, "");
+  const owningExtensionId = scheme === "chrome-extension" ? parsed.hostname : null;
+  const internal = ["chrome", "chrome-untrusted", "devtools", "view-source"].includes(scheme);
+  const otherExtension = owningExtensionId && owningExtensionId !== chrome.runtime.id;
+  const inspectable = !internal && !otherExtension;
+  let reason = null;
+  if (internal) reason = `${scheme}:// pages are protected Chrome surfaces and reject debugger attachment.`;
+  else if (otherExtension) reason = `Chrome blocks one extension from debugging another extension's chrome-extension:// pages.`;
+  return {
+    tabId: tab.id,
+    url: tab.url || "",
+    scheme,
+    inspectable,
+    owningExtensionId,
+    reason,
+    httpPageWouldBeInspectable: !inspectable,
+    backTargetKnown: false,
+    goingBackWouldRestoreAccess: inspectable ? false : null,
+  };
+}
+
+async function inspectability(tab) {
+  const access = tabAccess(tab);
+  const debuggerTarget = (await chrome.debugger.getTargets()).find((target) => target.tabId === tab.id && target.attached);
+  return {
+    ...access,
+    debugger: debuggerOwnership(tab.id) || (debuggerTarget ? { blockedBy: "external-debugger", recovery: "Close DevTools or the other debugger client for this tab." } : null),
+  };
+}
+
+async function pageCapabilities(tab) {
+  const access = await inspectability(tab);
+  const pdf = /\.pdf(?:$|[?#])/i.test(tab.url || "") || /[?&]file=.*\.pdf/i.test(tab.url || "");
+  const documentAccess = access.inspectable && !pdf;
+  return {
+    tabId: tab.id,
+    url: tab.url || "",
+    scheme: access.scheme,
+    pageType: pdf ? "pdf" : access.owningExtensionId ? "extension" : "document",
+    capabilities: {
+      domInspection: documentAccess,
+      accessibilitySnapshot: documentAccess,
+      screenshot: access.inspectable,
+      evaluation: documentAccess,
+      debuggerAttachment: access.inspectable,
+      networkCapture: access.inspectable,
+      storageAccess: documentAccess && ["http", "https", "file", "chrome-extension"].includes(access.scheme),
+      input: documentAccess,
+      extensionPageAccess: !access.owningExtensionId || access.owningExtensionId === chrome.runtime.id,
+    },
+    reasons: [access.reason, pdf ? "PDF tabs do not expose a normal page DOM." : null].filter(Boolean),
+  };
+}
+
+async function doctor(tab, owner, params) {
+  const access = await inspectability(tab);
+  const manifest = chrome.runtime.getManifest();
+  const versions = { cli: params.cliVersion || null, nativeHost: hostVersion || null, extension: manifest.version, protocol: PROTOCOL_VERSION };
+  let permissions;
+  try { permissions = await chrome.permissions.contains({ permissions: REQUIRED_PERMISSIONS, origins: REQUIRED_ORIGINS }); }
+  catch (error) { permissions = errorMessage(error); }
+  const checks = [
+    { name: "native-messaging", ok: hostOnline && Boolean(nativePort), detail: hostOnline ? "connected" : "disconnected" },
+    { name: "versions", ok: Boolean(versions.cli && versions.nativeHost) && versions.cli === versions.nativeHost && versions.cli === versions.extension, detail: versions },
+    { name: "permissions", ok: permissions === true, detail: permissions === true ? { permissions: REQUIRED_PERMISSIONS, origins: REQUIRED_ORIGINS } : permissions },
+    { name: "inspectability", ok: access.inspectable, detail: access.reason || "inspectable" },
+  ];
+  if (access.inspectable) {
+    try {
+      const evaluated = await withDebugger(tab.id, owner, (target) => cdp(target, "Runtime.evaluate", { expression: "1 + 1", returnByValue: true }));
+      checks.push({ name: "cdp-evaluation", ok: evaluated.result?.value === 2, detail: evaluated.result?.value });
+    } catch (error) {
+      checks.push({ name: "cdp-evaluation", ok: false, detail: errorMessage(error), recovery: error?.details?.recovery });
+    }
+  }
+  return { ok: checks.every((check) => check.ok), versions, checks, inspectability: access };
+}
+
+async function locateElements(tabId, owner, params) {
+  return withDebugger(tabId, owner, async (target) => {
+    await Promise.all([cdp(target, "Accessibility.enable"), cdp(target, "DOM.enable")]);
+    const { nodes = [] } = await cdp(target, "Accessibility.getFullAXTree");
+    const role = String(params.role || "").toLowerCase();
+    const name = String(params.name || "").toLowerCase();
+    const text = String(params.text || "").toLowerCase();
+    const candidates = nodes.filter((node) => {
+      const nodeRole = String(node.role?.value || "").toLowerCase();
+      const nodeName = String(node.name?.value || "").toLowerCase();
+      const searchable = `${nodeName} ${node.value?.value || ""} ${node.description?.value || ""}`.toLowerCase();
+      return node.backendDOMNodeId && (!role || nodeRole === role) && (!name || nodeName.includes(name)) && (!text || searchable.includes(text));
+    }).slice(0, params.maxResults === undefined ? 50 : Math.max(0, Number(params.maxResults)));
+    const matches = [];
+    for (const candidate of candidates) {
+      const resolved = await cdp(target, "DOM.resolveNode", { backendNodeId: candidate.backendDOMNodeId }).catch(() => null);
+      if (!resolved?.object?.objectId) continue;
+      try {
+        const details = await cdp(target, "Runtime.callFunctionOn", {
+          objectId: resolved.object.objectId,
+          returnByValue: true,
+          functionDeclaration: `function() {
+            const el=this, unique=s=>{try{return document.querySelectorAll(s).length===1}catch{return false}}, esc=CSS.escape;
+            const generated=v=>/[a-f0-9]{8,}|(?:^|[-_])\\d{4,}|css-[a-z0-9]{5,}/i.test(v||'');
+            const candidates=[];
+            for(const attr of ['data-testid','data-test','name','aria-label']){const value=el.getAttribute?.(attr);if(value)candidates.push({selector:el.tagName.toLowerCase()+'['+attr+'="'+esc(value)+'"]',stable:true});}
+            if(el.id)candidates.unshift({selector:'#'+esc(el.id),stable:!generated(el.id)});
+            let chosen=candidates.find(item=>unique(item.selector));
+            if(!chosen){let node=el,parts=[];while(node&&node.nodeType===1&&parts.length<6){let part=node.tagName.toLowerCase();const siblings=[...(node.parentElement?.children||[])].filter(item=>item.tagName===node.tagName);if(siblings.length>1)part+=':nth-of-type('+(siblings.indexOf(node)+1)+')';parts.unshift(part);const selector=parts.join(' > ');if(unique(selector)){chosen={selector,stable:false};break;}node=node.parentElement;}}
+            const rect=el.getBoundingClientRect(), style=getComputedStyle(el), className=typeof el.className==='string'?el.className:'';
+            return {selector:chosen?.selector||null,selectorStable:Boolean(chosen?.stable),generated:generated(el.id)||generated(className),visible:rect.width>0&&rect.height>0&&style.visibility!=='hidden'&&style.display!=='none',enabled:!el.disabled&&el.getAttribute?.('aria-disabled')!=='true',tag:el.tagName,coordinates:{x:rect.left+rect.width/2,y:rect.top+rect.height/2}};
+          }`,
+        });
+        matches.push({
+          backendNodeId: candidate.backendDOMNodeId,
+          role: candidate.role?.value,
+          name: candidate.name?.value,
+          ...details.result?.value,
+        });
+      } finally {
+        await cdp(target, "Runtime.releaseObject", { objectId: resolved.object.objectId }).catch(() => {});
+      }
+    }
+    return { tabId, url: (await chrome.tabs.get(tabId)).url || "", matches };
+  });
+}
+
+function globRegex(value) {
+  return new RegExp(`^${String(value).replace(/[.+^${}()|[\]\\]/g, "\\$&").replaceAll("*", ".*")}$`, "i");
+}
+
+async function watchPage(tab, owner, params) {
+  const startedAt = Date.now();
+  const timeout = durationMs(params.duration, 30_000);
+  if (params.urlChanges) {
+    const before = tab.url || "";
+    while (Date.now() - startedAt <= timeout) {
+      const current = await chrome.tabs.get(tab.id);
+      if ((current.url || "") !== before) return { matched: true, events: [{ type: "url", before, after: current.url || "" }], elapsedMs: Date.now() - startedAt };
+      await sleep(100);
+    }
+    return { matched: false, events: [], elapsedMs: Date.now() - startedAt };
+  }
+  if (params.selector) {
+    try {
+      const matched = await waitForPage(tab.id, owner, { selector: params.selector, duration: timeout });
+      return { matched: true, events: [{ type: "selector", selector: params.selector }], elapsedMs: matched.elapsedMs };
+    } catch (error) {
+      if (!errorMessage(error).startsWith("Condition did not match")) throw error;
+      return { matched: false, events: [], elapsedMs: Date.now() - startedAt };
+    }
+  }
+  if (params.request) {
+    const capture = networkCaptures.get((await startNetwork(tab.id)).session);
+    const pattern = globRegex(params.request);
+    try {
+      while (Date.now() - startedAt <= timeout) {
+        const matches = [...capture.requests.values()].filter((request) => pattern.test(request.url));
+        if (matches.length) return { matched: true, events: matches, elapsedMs: Date.now() - startedAt };
+        await sleep(100);
+      }
+      return { matched: false, events: [], elapsedMs: Date.now() - startedAt };
+    } finally {
+      await stopNetwork(capture).catch(() => {});
+    }
+  }
+  return watchConsole(tab.id, owner, params.console, timeout);
+}
+
+async function watchConsole(tabId, owner, level, timeout) {
+  if (consoleCaptures.has(tabId)) throw new Error(`Tab ${tabId} already has a console capture`);
+  const capture = { events: [], startedAt: Date.now() };
+  const levels = level === "all" ? null : new Set(level === "warning" ? ["warning", "warn"] : ["error", "exception"]);
+  consoleCaptures.set(tabId, capture);
+  try {
+    return await withDebugger(tabId, owner, async (target) => {
+      await Promise.all([cdp(target, "Runtime.enable"), cdp(target, "Log.enable")]);
+      while (Date.now() - capture.startedAt <= timeout) {
+        const events = capture.events.filter((event) => !levels || levels.has(event.level) || levels.has(event.source));
+        if (events.length) return { matched: true, events, elapsedMs: Date.now() - capture.startedAt };
+        await sleep(100);
+      }
+      return { matched: false, events: [], elapsedMs: Date.now() - capture.startedAt };
+    });
+  } finally {
+    consoleCaptures.delete(tabId);
+  }
+}
+
 async function accessibilitySnapshot(tabId, owner, params) {
   return withDebugger(tabId, owner, async (target) => {
-    await cdp(target, "Accessibility.enable");
+    await Promise.all([cdp(target, "Accessibility.enable"), cdp(target, "DOM.enable")]);
     const result = await cdp(target, "Accessibility.getFullAXTree", params.depth ? { depth: Number(params.depth) } : undefined);
-    return result;
+    let nodes = result.nodes || [];
+    if (params.selector) {
+      const { root } = await cdp(target, "DOM.getDocument", { depth: -1, pierce: true });
+      const { nodeId } = await cdp(target, "DOM.querySelector", { nodeId: root.nodeId, selector: checkedSelector(params.selector) });
+      if (!nodeId) throw new Error("Element not found");
+      const { node } = await cdp(target, "DOM.describeNode", { nodeId, depth: -1, pierce: true });
+      const backendIds = new Set();
+      const collect = (current) => {
+        if (current.backendNodeId) backendIds.add(current.backendNodeId);
+        for (const child of current.children || []) collect(child);
+        if (current.contentDocument) collect(current.contentDocument);
+        if (current.shadowRoots) for (const shadow of current.shadowRoots) collect(shadow);
+      };
+      collect(node);
+      nodes = nodes.filter((item) => backendIds.has(item.backendDOMNodeId));
+    }
+    const role = String(params.role || "").toLowerCase();
+    const name = String(params.name || "").toLowerCase();
+    if (role) nodes = nodes.filter((node) => String(node.role?.value || "").toLowerCase().includes(role));
+    if (name) nodes = nodes.filter((node) => String(node.name?.value || "").toLowerCase().includes(name));
+    const total = nodes.length;
+    const maxNodes = params.maxNodes === undefined ? Infinity : Math.max(0, Number(params.maxNodes));
+    nodes = nodes.slice(0, maxNodes);
+    if (params.compact) {
+      nodes = nodes.map((node) => ({
+        nodeId: node.nodeId,
+        backendDOMNodeId: node.backendDOMNodeId,
+        role: node.role?.value,
+        name: node.name?.value,
+        value: node.value?.value,
+        description: node.description?.value,
+        properties: Object.fromEntries((node.properties || []).map((property) => [property.name, property.value?.value])),
+      }));
+    }
+    return { tabId, url: (await chrome.tabs.get(tabId)).url || "", nodes, total, returned: nodes.length, limited: nodes.length < total, compact: Boolean(params.compact) };
   });
 }
 
 async function pageDom(tabId, owner, params) {
   return withDebugger(tabId, owner, async (target) => {
-    const expression = "'<!doctype html>\\n' + document.documentElement.outerHTML";
+    const selector = params.selector ? checkedSelector(params.selector) : null;
+    const expression = selector
+      ? `(() => { const el=document.querySelector(${JSON.stringify(selector)}); if(!el) throw new Error('Element not found'); return el.outerHTML; })()`
+      : "'<!doctype html>\\n' + document.documentElement.outerHTML";
     const result = await cdp(target, "Runtime.evaluate", { expression, returnByValue: true });
-    if (result.exceptionDetails) throw new Error(result.exceptionDetails.text || "DOM evaluation failed");
-    return { html: result.result?.value || "", url: (await chrome.tabs.get(tabId)).url };
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text || "DOM evaluation failed");
+    return { html: result.result?.value || "", url: (await chrome.tabs.get(tabId)).url, selector: selector || undefined };
   });
 }
 
 async function visibleText(tabId, owner, params) {
   return withDebugger(tabId, owner, async (target) => {
+    const selector = params.selector ? checkedSelector(params.selector) : null;
     const result = await cdp(target, "Runtime.evaluate", {
-      expression: "document.body?.innerText || ''",
+      expression: selector
+        ? `(() => { const el=document.querySelector(${JSON.stringify(selector)}); if(!el) throw new Error('Element not found'); return el.innerText || ''; })()`
+        : "document.body?.innerText || ''",
       returnByValue: true,
     });
-    return { text: result.result?.value || "" };
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "Visible-text evaluation failed");
+    return { tabId, url: (await chrome.tabs.get(tabId)).url || "", text: result.result?.value || "", selector: selector || undefined };
   });
 }
 
@@ -652,7 +1041,7 @@ async function screenshot(tabId, owner, params) {
       captureBeyondViewport: params.fullPage !== false,
       clip,
     });
-    return { data: result.data, format, tabId };
+    return { data: result.data, format, tabId, url: (await chrome.tabs.get(tabId)).url || "" };
   });
 }
 
@@ -691,7 +1080,7 @@ async function evaluate(tab, owner, params) {
     if (params.evalTimeout !== undefined) options.timeout = Math.max(0, Number(params.evalTimeout));
     const result = await cdp(target, "Runtime.evaluate", options);
     if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text || "Evaluation failed");
-    return result.result;
+    return params.valueOnly ? result.result?.value : result.result;
   });
 }
 
@@ -711,15 +1100,72 @@ async function elementPoint(target, selectorValue) {
   return result.result.value;
 }
 
+async function backendNodePoint(target, backendNodeIdValue) {
+  const backendNodeId = Number(backendNodeIdValue);
+  if (!Number.isInteger(backendNodeId) || backendNodeId <= 0) throw new Error("--backend-node-id must be a positive integer");
+  let model;
+  let node;
+  try {
+    await cdp(target, "DOM.enable");
+    await cdp(target, "DOM.scrollIntoViewIfNeeded", { backendNodeId }).catch(() => {});
+    [{ model }, { node }] = await Promise.all([
+      cdp(target, "DOM.getBoxModel", { backendNodeId }),
+      cdp(target, "DOM.describeNode", { backendNodeId }),
+    ]);
+  } catch {
+    throw new Error(`Backend DOM node ${backendNodeId} is stale or unavailable; take a new snapshot and retry`);
+  }
+  const quad = model?.content || model?.border;
+  if (!quad?.length) throw new Error(`Backend DOM node ${backendNodeId} has no clickable box`);
+  const xs = quad.filter((_, index) => index % 2 === 0);
+  const ys = quad.filter((_, index) => index % 2 === 1);
+  return {
+    x: xs.reduce((sum, value) => sum + value, 0) / xs.length,
+    y: ys.reduce((sum, value) => sum + value, 0) / ys.length,
+    backendNodeId,
+    tag: node?.nodeName,
+  };
+}
+
 async function click(tabId, owner, params) {
-  return withDebugger(tabId, owner, async (target) => {
-    const point = params.selector ? await elementPoint(target, params.selector) : { x: Number(params.x), y: Number(params.y) };
-    if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) throw new Error("click requires --selector or numeric --x and --y");
-    const clickCount = params.double ? 2 : 1;
-    await cdp(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount });
-    await cdp(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", clickCount });
-    return { ...point, clickCount };
+  const before = await chrome.tabs.get(tabId);
+  let point;
+  let pressed = false;
+  const clickCount = params.double ? 2 : 1;
+  let outcome = "success";
+  try {
+    await withDebugger(tabId, owner, async (target) => {
+      point = params.selector
+        ? await elementPoint(target, params.selector)
+        : params.backendNodeId !== undefined
+          ? await backendNodePoint(target, params.backendNodeId)
+          : { x: Number(params.x), y: Number(params.y) };
+      if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) throw new Error("click requires --selector, --backend-node-id, or numeric --x and --y");
+      await cdp(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount });
+      pressed = true;
+      await cdp(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", clickCount });
+    });
+  } catch (error) {
+    if (!pressed || errorMessage(error) !== "Detached while handling command.") throw error;
+    outcome = "unknown";
+  }
+  const waitResult = await waitForAction(tabId, owner, params).catch((error) => {
+    if (outcome !== "unknown") throw error;
+    return { matched: false, error: errorMessage(error) };
   });
+  const current = waitResult ? await chrome.tabs.get(tabId) : await observeTab(tabId, before.url);
+  return {
+    ...point,
+    clickCount,
+    outcome,
+    dispatchCompleted: outcome === "success",
+    sideEffectMayHaveOccurred: pressed,
+    beforeUrl: before.url || "",
+    lastKnownUrl: current.url || "",
+    title: current.title || "",
+    wait: waitResult || undefined,
+    recommendedAction: outcome === "unknown" ? "inspect-current-state" : undefined,
+  };
 }
 
 async function typeText(tabId, owner, selectorValue, textValue) {
@@ -858,15 +1304,30 @@ async function waitForPage(tabId, owner, params) {
     : params.selector
       ? `Boolean(document.querySelector(${JSON.stringify(String(params.selector))}))`
       : `Boolean(document.body?.innerText.includes(${JSON.stringify(String(params.text || ""))}))`;
-  return withDebugger(tabId, owner, async (target) => {
-    while (Date.now() <= deadline) {
-      const result = await cdp(target, "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
-      if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "Wait expression failed");
-      if (result.result?.value) return { matched: true, elapsedMs: timeout - Math.max(0, deadline - Date.now()) };
+  while (Date.now() <= deadline) {
+    if ((await chrome.tabs.get(tabId)).status === "loading") {
       await sleep(100);
+      continue;
     }
-    throw new Error(`Condition did not match within ${timeout}ms`);
-  });
+    try {
+      return await withDebugger(tabId, owner, async (target) => {
+        while (Date.now() <= deadline) {
+          if ((await chrome.tabs.get(tabId)).status === "loading") {
+            await sleep(100);
+            continue;
+          }
+          const result = await cdp(target, "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
+          if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "Wait expression failed");
+          if (result.result?.value) return { matched: true, elapsedMs: timeout - Math.max(0, deadline - Date.now()) };
+          await sleep(100);
+        }
+        throw new Error(`Condition did not match within ${timeout}ms`);
+      });
+    } catch (error) {
+      if (errorMessage(error) !== "Detached while handling command." || !(await chrome.tabs.get(tabId).catch(() => null))) throw error;
+    }
+  }
+  throw new Error(`Condition did not match within ${timeout}ms`);
 }
 
 async function handleDialog(tabId, owner, params) {
@@ -884,7 +1345,8 @@ async function resizePage(tabId, owner, params) {
   const target = await emulationTarget(tabId);
   try {
     await cdp(target, "Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: Number(params.deviceScaleFactor) || 1, mobile: Boolean(params.mobile) });
-    return { width, height, persistent: true };
+    const ttlMs = scheduleEmulationCleanup(tabId, params.ttl);
+    return { width, height, persistent: true, ...(ttlMs === null ? {} : { ttlMs }) };
   } catch (error) {
     if (!hadEmulation) {
       const emulationOwner = emulationOwners.get(tabId);
@@ -900,16 +1362,7 @@ async function emulatePage(tabId, owner, params) {
   const target = await emulationTarget(tabId);
   try {
     if (params.clear) {
-      await Promise.allSettled([
-        cdp(target, "Emulation.clearDeviceMetricsOverride"),
-        cdp(target, "Emulation.clearGeolocationOverride"),
-        cdp(target, "Emulation.setCPUThrottlingRate", { rate: 1 }),
-        cdp(target, "Network.emulateNetworkConditions", { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }),
-        cdp(target, "Network.setExtraHTTPHeaders", { headers: {} }),
-      ]);
-      const emulationOwner = emulationOwners.get(tabId);
-      emulationOwners.delete(tabId);
-      await detach(tabId, emulationOwner);
+      await clearEmulation(tabId);
       return { cleared: true };
     }
     if (params.viewport) {
@@ -925,7 +1378,8 @@ async function emulatePage(tabId, owner, params) {
     if ([params.offline, params.latency, params.download, params.upload].some((value) => value !== undefined)) {
       await cdp(target, "Network.emulateNetworkConditions", { offline: Boolean(params.offline), latency: Number(params.latency) || 0, downloadThroughput: params.download === undefined ? -1 : Number(params.download), uploadThroughput: params.upload === undefined ? -1 : Number(params.upload) });
     }
-    return { configured: true, persistent: true };
+    const ttlMs = scheduleEmulationCleanup(tabId, params.ttl);
+    return { configured: true, persistent: true, ...(ttlMs === null ? {} : { ttlMs }) };
   } catch (error) {
     if (!params.clear && !hadEmulation) {
       const emulationOwner = emulationOwners.get(tabId);
@@ -934,6 +1388,33 @@ async function emulatePage(tabId, owner, params) {
     }
     throw error;
   }
+}
+
+function scheduleEmulationCleanup(tabId, ttl) {
+  clearTimeout(emulationTimers.get(tabId));
+  emulationTimers.delete(tabId);
+  if (ttl === undefined) return null;
+  const ttlMs = durationMs(ttl);
+  emulationTimers.set(tabId, setTimeout(() => clearEmulation(tabId).catch(() => {}), ttlMs));
+  return ttlMs;
+}
+
+async function clearEmulation(tabId) {
+  if (!emulationOwners.has(tabId)) await emulationTarget(tabId);
+  const target = { tabId };
+  await Promise.allSettled([
+    cdp(target, "Emulation.clearDeviceMetricsOverride"),
+    cdp(target, "Emulation.clearGeolocationOverride"),
+    cdp(target, "Emulation.setCPUThrottlingRate", { rate: 1 }),
+    cdp(target, "Emulation.setEmulatedMedia", { features: [] }),
+    cdp(target, "Network.emulateNetworkConditions", { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }),
+    cdp(target, "Network.setExtraHTTPHeaders", { headers: {} }),
+  ]);
+  clearTimeout(emulationTimers.get(tabId));
+  emulationTimers.delete(tabId);
+  const emulationOwner = emulationOwners.get(tabId);
+  emulationOwners.delete(tabId);
+  await detach(tabId, emulationOwner);
 }
 
 async function emulationTarget(tabId) {
@@ -958,13 +1439,21 @@ function findCapture(sessionId, tabId) {
 }
 
 async function startNetwork(tabId, params = {}) {
-  if (networkCaptureByTab.has(tabId)) throw new Error(`Tab ${tabId} already has an active network capture`);
+  if (networkCaptureByTab.has(tabId)) {
+    const sessionId = networkCaptureByTab.get(tabId);
+    throw commandError(`Tab ${tabId} already has an active network capture`, {
+      blockedBy: "network-capture",
+      sessionId,
+      recovery: `chrome-bridge network stop --tab=${tabId} --session=${sessionId}`,
+    });
+  }
   const id = crypto.randomUUID();
   const tab = await chrome.tabs.get(tabId);
   const capture = {
     id,
     tabId,
     tabTitle: tab.title || tab.url || "Untitled tab",
+    tabUrl: tab.url || "",
     owner: `network:${id}`,
     startedAt: Date.now(),
     stoppedAt: null,
@@ -973,6 +1462,7 @@ async function startNetwork(tabId, params = {}) {
     pending: [],
     includeBodies: Boolean(params.bodies),
     urlFilter: String(params.urlFilter || "").toLowerCase(),
+    lastEventAt: Date.now(),
     sessions: new Set(),
   };
   await attach(tabId, capture.owner);
@@ -983,18 +1473,55 @@ async function startNetwork(tabId, params = {}) {
     await detach(tabId, capture.owner);
     throw error;
   }
-  if (params.maxDuration !== undefined) capture.timer = setTimeout(() => finishNetwork(capture).catch(() => {}), durationMs(params.maxDuration));
   networkCaptures.set(id, capture);
   networkCaptureByTab.set(tabId, id);
+  const lease = params.ttl ?? params.maxDuration;
+  const ttlMs = lease === undefined ? null : durationMs(lease);
+  capture.ttlMs = ttlMs;
+  capture.expiresAt = ttlMs === null ? null : Date.now() + ttlMs;
+  if (ttlMs !== null) capture.timer = setTimeout(() => stopNetwork(capture).catch(() => {}), ttlMs);
   scheduleStatusBroadcast();
-  return { session: id, tabId, startedAt: new Date(capture.startedAt).toISOString(), maxDurationMs: params.maxDuration === undefined ? null : durationMs(params.maxDuration) };
+  return { session: id, tabId, startedAt: new Date(capture.startedAt).toISOString(), ttlMs, expiresAt: capture.expiresAt ? new Date(capture.expiresAt).toISOString() : null, bodiesRequested: capture.includeBodies };
 }
 
 async function captureNetwork(tabId, params = {}) {
-  const started = await startNetwork(tabId, { ...params, maxDuration: durationMs(params.duration) });
+  const started = await startNetwork(tabId, params);
   const capture = networkCaptures.get(started.session);
-  await sleep(durationMs(params.duration));
-  return stopNetwork(capture, Boolean(params.har));
+  try {
+    if (params.reload) await chrome.tabs.reload(tabId);
+    const wait = params.wait === "network-idle"
+      ? await waitForNetworkIdle(capture, durationMs(params.duration, 10_000))
+      : (await sleep(durationMs(params.duration)), { mode: "duration", matched: true, elapsedMs: durationMs(params.duration) });
+    const result = await stopNetwork(capture, Boolean(params.har));
+    const records = [...capture.requests.values()];
+    const metadata = {
+      initialLoadCaptured: Boolean(params.reload),
+      bodiesRequested: Boolean(params.bodies),
+      bodiesCaptured: records.filter((record) => "body" in record).length,
+      bodyCaptureErrors: records.filter((record) => record.bodyError).length,
+      wait,
+    };
+    if (params.har) return { ...result, chromeBridge: metadata };
+    return { ...presentNetwork(result, params), ...metadata };
+  } catch (error) {
+    await stopNetwork(capture).catch(() => {});
+    throw error;
+  }
+}
+
+async function waitForNetworkIdle(capture, timeout) {
+  // ponytail: 500 ms quiet window; add a configurable idle window if long-polling apps need different semantics.
+  const startedAt = Date.now();
+  const deadline = startedAt + timeout;
+  while (Date.now() <= deadline) {
+    const tab = await chrome.tabs.get(capture.tabId);
+    const pending = [...capture.requests.values()].filter((record) => !record.finishedTimestamp && !record.failed).length;
+    if (tab.status === "complete" && pending === 0 && Date.now() - capture.lastEventAt >= 500) {
+      return { mode: "network-idle", matched: true, elapsedMs: Date.now() - startedAt, quietMs: 500 };
+    }
+    await sleep(100);
+  }
+  return { mode: "network-idle", matched: false, elapsedMs: Date.now() - startedAt, pendingRequests: [...capture.requests.values()].filter((record) => !record.finishedTimestamp && !record.failed).length };
 }
 
 async function finishNetwork(capture) {
@@ -1019,19 +1546,70 @@ function networkSnapshot(capture) {
   return {
     session: capture.id,
     tabId: capture.tabId,
+    url: capture.tabUrl,
     startedAt: new Date(capture.startedAt).toISOString(),
     stoppedAt: capture.stoppedAt ? new Date(capture.stoppedAt).toISOString() : null,
+    expiresAt: capture.expiresAt ? new Date(capture.expiresAt).toISOString() : null,
     active: !capture.stoppedAt,
+    bodiesRequested: capture.includeBodies,
+    bodiesCaptured: [...capture.requests.values()].filter((record) => "body" in record).length,
+    bodyCaptureErrors: [...capture.requests.values()].filter((record) => record.bodyError).length,
     requests: [...capture.requests.values()],
     webSockets: capture.webSockets,
   };
+}
+
+function presentNetwork(snapshot, params = {}) {
+  if (params.websockets) {
+    const { requests, ...metadata } = snapshot;
+    return { ...metadata, webSockets: snapshot.webSockets };
+  }
+
+  let requests = snapshot.requests;
+  if (params.errorsOnly) requests = requests.filter((record) => record.failed || Number(record.status) >= 400);
+  if (params.eventStream) requests = requests.filter((record) => {
+    const contentType = record.mimeType || record.responseHeaders?.["content-type"] || record.responseHeaders?.["Content-Type"] || "";
+    return String(contentType).toLowerCase().includes("text/event-stream");
+  });
+  if (!params.graphql) return { ...snapshot, requests };
+
+  const groups = new Map();
+  for (const record of requests) {
+    const operationNames = graphqlOperationNames(record);
+    for (const operationName of operationNames) {
+      const group = groups.get(operationName) || { operationName, count: 0, requests: [] };
+      group.count += 1;
+      group.requests.push(record);
+      groups.set(operationName, group);
+    }
+  }
+  const { requests: ignored, ...metadata } = snapshot;
+  return { ...metadata, graphqlOperations: [...groups.values()] };
+}
+
+function graphqlOperationNames(record) {
+  if (!record.postData) return ["anonymous"];
+  try {
+    const parsed = JSON.parse(record.postData);
+    const entries = Array.isArray(parsed) ? parsed : [parsed];
+    return entries.map((entry) => String(entry?.operationName || "anonymous"));
+  } catch {
+    const match = String(record.postData).match(/\b(?:query|mutation|subscription)\s+([A-Za-z_][A-Za-z0-9_]*)/);
+    return [match?.[1] || "anonymous"];
+  }
 }
 
 async function networkGetBody(capture, requestId, params) {
   if (capture.stoppedAt) throw new Error("Response bodies are only available while the capture is attached");
   const record = capture.requests.get(String(requestId)) || [...capture.requests.values()].find((item) => item.requestId === String(requestId));
   if (!record) throw new Error("Unknown request id for this capture");
-  return getResponseBody(capture, record, params);
+  const result = await getResponseBody(capture, record, params);
+  if (!params.pretty || result.base64Encoded) return result;
+  try {
+    return { ...result, parsed: JSON.parse(result.body) };
+  } catch {
+    return { ...result, prettyError: "Response body is not valid JSON" };
+  }
 }
 
 async function getResponseBody(capture, record, params = {}) {
@@ -1360,10 +1938,12 @@ async function startCdpSession(tab, params) {
     if (existing) throw new Error(`Target ${target.targetId} is already attached to another debugger client`);
     await chrome.debugger.attach(target, PROTOCOL_VERSION);
   }
-  const session = { id, target, owner, startedAt: Date.now() };
+  const ttlMs = params.ttl === undefined ? null : durationMs(params.ttl);
+  const session = { id, target, owner, startedAt: Date.now(), ttlMs };
   manualCdpSessions.set(id, session);
+  if (ttlMs !== null) session.timer = setTimeout(() => stopCdpSession(id).catch(() => {}), ttlMs);
   scheduleStatusBroadcast();
-  return { session: id, target, startedAt: new Date(session.startedAt).toISOString() };
+  return { session: id, target, startedAt: new Date(session.startedAt).toISOString(), ...(ttlMs === null ? {} : { ttlMs, expiresAt: new Date(session.startedAt + ttlMs).toISOString() }) };
 }
 
 async function stopCdpSession(idValue) {
@@ -1371,6 +1951,7 @@ async function stopCdpSession(idValue) {
   const session = manualCdpSessions.get(id);
   if (!session) throw new Error("cdp session stop requires a valid --bridge-session");
   manualCdpSessions.delete(id);
+  clearTimeout(session.timer);
   if (session.target.tabId !== undefined) await detach(session.target.tabId, session.owner);
   else await chrome.debugger.detach(session.target).catch(() => {});
   scheduleStatusBroadcast();
@@ -1430,9 +2011,16 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 });
 
 chrome.debugger.onDetach.addListener((source) => {
-  if (source.tabId !== undefined) emulationOwners.delete(source.tabId);
+  if (source.tabId !== undefined) {
+    emulationOwners.delete(source.tabId);
+    clearTimeout(emulationTimers.get(source.tabId));
+    emulationTimers.delete(source.tabId);
+  }
   for (const [id, session] of manualCdpSessions) {
-    if (debuggeeKey(session.target) === debuggeeKey(source)) manualCdpSessions.delete(id);
+    if (debuggeeKey(session.target) === debuggeeKey(source)) {
+      clearTimeout(session.timer);
+      manualCdpSessions.delete(id);
+    }
   }
   scheduleStatusBroadcast();
 });
@@ -1448,6 +2036,7 @@ async function handleAttachedTarget(capture, params) {
 
 function handleNetworkEvent(capture, source, method, params) {
   scheduleStatusBroadcast();
+  capture.lastEventAt = Date.now();
   const requestKey = `${source.sessionId || "root"}:${params.requestId || ""}`;
   if (method === "Network.requestWillBeSent") {
     const url = String(params.request?.url || "");
@@ -1560,7 +2149,11 @@ chrome.debugger.onDetach.addListener((source) => {
   const captureId = networkCaptureByTab.get(source.tabId);
   if (captureId) {
     const capture = networkCaptures.get(captureId);
-    if (capture) capture.stoppedAt = Date.now();
+    if (capture) {
+      capture.stoppedAt = Date.now();
+      clearTimeout(capture.timer);
+      networkCaptures.delete(captureId);
+    }
     networkCaptureByTab.delete(source.tabId);
   }
 });

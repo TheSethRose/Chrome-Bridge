@@ -38,7 +38,6 @@ dd { margin: 0; font: 700 16px/1 var(--code); }
 .capture-list { display: grid; gap: 8px; margin-top: 10px; }
 .capture-list strong { display: block; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 .capture-list span { color: var(--muted); font: 11px var(--code); }
-.activity-summary { margin-top: 10px; color: var(--muted); font: 10.5px/1.5 var(--code); }
 .live-empty { padding: 12px 14px; border: 1px dashed var(--line); border-radius: 10px; color: var(--muted); font-size: 11px; line-height: 1.45; }
 .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .log-toolbar { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }

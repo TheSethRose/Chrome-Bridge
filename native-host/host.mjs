@@ -5,6 +5,7 @@ import { atomicWriteJson, ensureRuntime } from "../shared/runtime.mjs";
 
 const MAX_FROM_CHROME = 64 * 1024 * 1024;
 const MAX_TO_CHROME = 1024 * 1024;
+const HOST_VERSION = "0.1.0";
 
 export function encodeNativeMessage(message) {
   const body = Buffer.from(JSON.stringify(message));
@@ -79,7 +80,7 @@ export async function runNativeHost(origin) {
 
   const handle = async (message) => {
     if (message?.type === "hello") {
-      await send({ type: "helloResult", ok: true });
+      await send({ type: "helloResult", ok: true, version: HOST_VERSION });
       writeState();
       return;
     }

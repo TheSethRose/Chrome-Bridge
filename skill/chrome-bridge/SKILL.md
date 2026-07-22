@@ -7,6 +7,8 @@ description: Inspect, debug, and operate the user's signed-in Chrome session wit
 
 Use `chrome-bridge` as the only browser interface. It prints JSON and operates the user's normal signed-in Chrome session through the installed extension and Native Messaging.
 
+Use `chrome-bridge <command> --help` or `chrome-bridge help <command>` before guessing syntax. Use `chrome-bridge commands --json` for the machine-readable command catalog, and `chrome-bridge doctor` when connection, version, permission, inspectability, or debugger ownership is unclear.
+
 ## Protect authenticated accounts
 
 Assume every interaction on a signed-in, rate-limited, or anti-abuse-protected site can affect account safety. Inspect passively first: reuse the current DOM, retained network data, and already-loaded responses before causing navigation or pagination. Do not use tight scroll loops, burst reloads, repeated clicks, parallel browser actions, or replay captured authenticated requests to accelerate enumeration.
@@ -37,10 +39,10 @@ Use the section links below to avoid loading an entire reference unnecessarily:
 
 ## Operating rules
 
-1. Multiple agents can use Chrome Bridge concurrently through the same extension and signed-in session, including the same tab. Each agent should run `chrome-bridge status` and `chrome-bridge list-tabs`, use explicit `--tab=ID` targets so active-tab changes do not redirect commands, and coordinate overlapping state changes on the same tab.
-2. Inspect narrowly first. Prefer a targeted `eval` or semantic `snapshot` over returning the entire DOM, network log, or storage database.
-3. Write large results with `--file=/absolute/path`; read [large results](references/data-and-state.md#large-results-and-native-messaging) before assuming terminal clipping means data loss.
+1. Multiple agents can use Chrome Bridge concurrently through the same extension and signed-in session, including the same tab. Each agent should run `chrome-bridge status` and `chrome-bridge list-tabs`, use explicit `--tab=ID` targets so active-tab changes do not redirect commands, and coordinate overlapping state changes on the same tab. A long-lived task may assign `tab name --tab=ID --name=NAME` and then use `--tab=NAME`; naming is a convenience, not a lock.
+2. Inspect narrowly first. Use `capabilities` before uncertain page types and `locate` for semantic element discovery; prefer filtered or compact `snapshot`, `visible-text --selector`, `dom --selector`, or `eval --value-only` over returning the entire DOM, network log, or storage database.
+3. Shape JSON results with `--fields`, `--jq`, `--max-results`, `--compact`, or `--ndjson`, and write artifacts with `--file=/absolute/path`. Raw screenshot, trace, and MHTML files cannot be combined with output shaping. Read [large results](references/data-and-state.md#large-results-and-native-messaging) before assuming terminal clipping means data loss.
 4. Perform external or destructive actions only when requested. Submit exactly the approved content, then verify the resulting page state or request.
-5. Stop captures and sessions when finished. Read [state lifetime and cleanup](references/data-and-state.md#state-lifetime-and-cleanup) when a debugger, capture, or emulation state may remain active.
+5. Stop captures and sessions when finished. Add `--ttl` to persistent network captures, CDP sessions, and emulation or resize state as abandoned-state cleanup, but stop explicitly when the final capture or result matters because TTL expiry discards in-memory capture state.
 
 Chrome blocks debugger attachment to internal `chrome://` pages and permits one debugger client per target. Close that tab's DevTools before using debugger-backed commands. Reload the unpacked Chrome Bridge extension after changing its manifest, service worker, or side-panel files.

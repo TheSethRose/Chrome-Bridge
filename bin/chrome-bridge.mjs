@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { chmod, lstat, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { coerceAndValidate, helpFor, resolveCommand, schema, suggestions } from "../shared/commands.mjs";
 import { atomicWriteJson, ensureRuntime } from "../shared/runtime.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = fileURLToPath(import.meta.url);
+const VERSION = JSON.parse(await readFile(path.join(ROOT, "package.json"), "utf8")).version;
 
 export function parseArguments(argv) {
   const positionals = [];
@@ -38,9 +41,9 @@ export function parseArguments(argv) {
 
 export function parseDuration(value, fallback) {
   if (value === undefined) return fallback;
-  const match = String(value).match(/^(\d+(?:\.\d+)?)(ms|s|m)?$/i);
+  const match = String(value).match(/^(\d+(?:\.\d+)?)(ms|s|m|h)?$/i);
   if (!match) throw new Error(`Invalid duration: ${value}`);
-  const factors = { ms: 1, s: 1_000, m: 60_000 };
+  const factors = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000 };
   return Number(match[1]) * factors[(match[2] || "ms").toLowerCase()];
 }
 
@@ -109,60 +112,26 @@ async function setup() {
 }
 
 export function normalizeCommand(parsed) {
-  const words = [...parsed.positionals];
-  const first = words.shift();
-  const second = words[0];
-  const options = { ...parsed.options };
-  for (const key of ["active", "bodies", "har", "fullPage", "double", "mobile", "offline", "clear", "paintOrder", "domRects", "blendedColors", "textOpacities"]) {
-    if (options[key] === "true") options[key] = true;
-    if (options[key] === "false") options[key] = false;
+  const resolved = resolveCommand(parsed.positionals);
+  if (!resolved) {
+    const requested = parsed.positionals.slice(0, 2).join(" ");
+    const likely = suggestions(requested);
+    throw new Error(`Unknown command: ${requested || "(none)"}${likely.length ? `\nDid you mean: ${likely.join(", ")}?` : ""}\nUse: chrome-bridge help`);
   }
-
-  if (options.duration !== undefined) options.duration = parseDuration(options.duration, 10_000);
-  if (options.maxDuration !== undefined) options.maxDuration = parseDuration(options.maxDuration, 60_000);
-  if (options.timeout !== undefined) options.timeout = parseDuration(options.timeout, 75_000);
-  if (options.evalTimeout !== undefined) options.evalTimeout = parseDuration(options.evalTimeout, 5_000);
-  if (options.tab !== undefined) options.tab = Number(options.tab);
-
-  const nested = {
-    "network capture": "network-capture",
-    "network start": "network-start",
-    "network tail": "network-tail",
-    "network stop": "network-stop",
-    "network get-body": "network-get-body",
-    "network export-har": "network-export-har",
-    "console capture": "console-capture",
-    "console tail": "console-capture",
-    "scripts list": "scripts-list",
-    "scripts get": "scripts-get",
-    "resources tree": "resources-tree",
-    "resources get": "resources-get",
-    "page mhtml": "page-mhtml",
-    "dom snapshot": "dom-snapshot",
-    "performance metrics": "performance-metrics",
-    "performance profile": "performance-profile",
-    "performance trace": "performance-trace",
-    "history search": "history-search",
-    "bookmarks tree": "bookmarks-tree",
-    "bookmarks search": "bookmarks-search",
-    "downloads search": "downloads-search",
-    "extensions list": "extensions-list",
-    "extension reload": "extension-reload",
-    "chrome call": "chrome-call",
-    "cdp send": "cdp-send",
-    "cdp events": "cdp-events",
-    "cdp session-start": "cdp-session-start",
-    "cdp session-stop": "cdp-session-stop",
-  };
-  const pair = `${first || ""} ${second || ""}`;
-  const command = nested[pair] || first;
-  if (nested[pair]) words.shift();
-  if (command === "eval") options.expression = words.join(" ");
+  const words = parsed.positionals.slice(resolved.consumed);
+  const options = { ...parsed.options };
+  const command = resolved.entry.id;
+  if (command === "eval" && !options.expression) options.expression = words.join(" ");
   if (["navigate", "new-tab"].includes(command) && !options.url && words.length) options.url = words.join(" ");
   if (["type-text", "wait-for"].includes(command) && !options.text && words.length) options.text = words.join(" ");
   if (command === "press-key" && !options.key && words.length) options.key = words.join("+");
   if (command === "network-get-body" && !options.request && words.length) options.request = words[0];
-  return { command, params: options };
+  if (words.length && !["eval", "navigate", "new-tab", "type-text", "wait-for", "press-key", "network-get-body"].includes(command)) {
+    throw new Error(`Unexpected argument: ${words[0]}. Use: ${resolved.entry.syntax}`);
+  }
+  delete options.help;
+  delete options.json;
+  return { command, params: coerceAndValidate(resolved.entry, options, (value) => parseDuration(value)) };
 }
 
 async function request(command, params) {
@@ -176,7 +145,11 @@ async function request(command, params) {
     try {
       const response = JSON.parse(await readFile(responseFile, "utf8"));
       await rm(responseFile, { force: true });
-      if (!response.ok) throw new Error(response.error || "Chrome Bridge command failed");
+      if (!response.ok) {
+        const error = new Error(response.error || "Chrome Bridge command failed");
+        error.details = response.details;
+        throw error;
+      }
       return response.result;
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
@@ -187,34 +160,85 @@ async function request(command, params) {
   throw new Error("Chrome Bridge timed out; confirm the unpacked extension is loaded");
 }
 
-async function writeResultFile(result, file, command) {
+async function writeResultFile(result, file, command, params) {
   const target = path.resolve(String(file));
   if (command === "screenshot") await writeFile(target, Buffer.from(result.data, "base64"));
   else if (["performance-trace", "page-mhtml"].includes(command)) await writeFile(target, result.data);
-  else await writeFile(target, `${JSON.stringify(result, null, 2)}\n`);
+  else await writeFile(target, `${serializeResult(result)}\n`);
   const info = await lstat(target);
-  return { file: target, bytes: info.size, format: result.format };
-}
-
-function help() {
+  const sha256 = createHash("sha256").update(await readFile(target)).digest("hex");
   return {
-    usage: "chrome-bridge <command> [options]",
-    commands: [
-      "status | list-tabs | new-tab | close-tab | activate-tab | navigate | reload | go-back | go-forward | detach",
-      "snapshot | dom | dom snapshot | visible-text | styles | screenshot | screencast | eval",
-      "click | hover | drag | type | type-text | press-key | fill-form | upload-file | wait-for | handle-dialog",
-      "resize | emulate",
-      "network capture|start|tail|stop|get-body|export-har",
-      "console capture | scripts list|get | resources tree|get | page mhtml",
-      "storage | cookies | targets",
-      "performance metrics|profile|trace",
-      "history search | bookmarks tree|search | downloads search | audit",
-      "extensions list | extension reload | chrome call",
-      "cdp session-start|session-stop | cdp send|events",
-    ],
-    commonOptions: ["--tab=ID", "--duration=10s", "--timeout=30s", "--file=PATH"],
+    file: target,
+    path: target,
+    sha256,
+    bytes: info.size,
+    capturedAt: new Date().toISOString(),
+    tabId: result?.tabId ?? (typeof params.tab === "number" ? params.tab : null),
+    url: result?.url || result?.finalUrl || result?.lastKnownUrl || null,
+    chromeBridgeVersion: VERSION,
+    format: result?.format || (command === "screenshot" ? path.extname(target).slice(1) : "json"),
   };
 }
+
+function projectFields(value, fields) {
+  if (!fields.length || value === null || typeof value !== "object") return value;
+  const project = (item) => item && typeof item === "object" && !Array.isArray(item)
+    ? Object.fromEntries(fields.filter((field) => field in item).map((field) => [field, item[field]]))
+    : item;
+  return Array.isArray(value) ? value.map(project) : project(value);
+}
+
+function shapeResult(value, params) {
+  let result = value;
+  if (params.jq) {
+    const filtered = spawnSync("jq", ["-c", String(params.jq)], { input: JSON.stringify(result), encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    if (filtered.error?.code === "ENOENT") throw new Error("--jq requires the jq executable on PATH");
+    if (filtered.status !== 0) throw new Error(`jq failed: ${String(filtered.stderr || "unknown error").trim()}`);
+    const values = String(filtered.stdout).split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    result = values.length === 1 ? values[0] : values;
+  }
+  if (params.fields) result = projectFields(result, String(params.fields).split(",").map((field) => field.trim()).filter(Boolean));
+  if (params.maxResults !== undefined) {
+    const limit = Math.max(0, Number(params.maxResults));
+    if (Array.isArray(result)) result = result.slice(0, limit);
+    else if (result && typeof result === "object") result = Object.fromEntries(Object.entries(result).map(([key, item]) => [key, Array.isArray(item) ? item.slice(0, limit) : item]));
+  }
+  return result;
+}
+
+function serializeResult(result) {
+  if (OUTPUT_OPTIONS.ndjson) return (Array.isArray(result) ? result : [result]).map((item) => JSON.stringify(item)).join("\n");
+  return JSON.stringify(result, null, OUTPUT_OPTIONS.compact ? undefined : 2);
+}
+
+function comparableSnapshot(value) {
+  const nodes = Array.isArray(value?.nodes) ? value.nodes : Array.isArray(value) ? value : null;
+  if (!nodes) return value;
+  return Object.fromEntries(nodes.map((node, index) => [String(node.backendDOMNodeId || node.nodeId || index), node]));
+}
+
+function diffValues(before, after, maxResults = 1_000) {
+  const changes = { added: [], removed: [], changed: [] };
+  const visit = (left, right, location = "$") => {
+    if (changes.added.length + changes.removed.length + changes.changed.length >= maxResults) return;
+    if (left === undefined) changes.added.push({ path: location, value: right });
+    else if (right === undefined) changes.removed.push({ path: location, value: left });
+    else if (left === null || right === null || typeof left !== "object" || typeof right !== "object") {
+      if (!Object.is(left, right)) changes.changed.push({ path: location, before: left, after: right });
+    } else {
+      for (const key of new Set([...Object.keys(left), ...Object.keys(right)])) visit(left[key], right[key], `${location}.${key}`);
+    }
+  };
+  visit(comparableSnapshot(before), comparableSnapshot(after));
+  return { counts: Object.fromEntries(Object.entries(changes).map(([key, items]) => [key, items.length])), ...changes };
+}
+
+async function snapshotDiff(params) {
+  const [before, after] = await Promise.all([params.before, params.after].map(async (file) => JSON.parse(await readFile(path.resolve(String(file)), "utf8"))));
+  return diffValues(before, after, params.maxResults === undefined ? 1_000 : Number(params.maxResults));
+}
+
+let OUTPUT_OPTIONS = {};
 
 async function main() {
   const origin = process.argv[2];
@@ -225,19 +249,43 @@ async function main() {
   }
 
   const parsed = parseArguments(process.argv.slice(2));
-  if (!parsed.positionals.length || ["help", "--help", "-h"].includes(parsed.positionals[0])) return help();
+  OUTPUT_OPTIONS = parsed.options;
+  if (!parsed.positionals.length || parsed.positionals[0] === "-h") return helpFor();
+  if (parsed.positionals[0] === "help") return helpFor(parsed.positionals.slice(1));
+  if (parsed.options.help) return helpFor(parsed.positionals);
+  if (parsed.positionals[0] === "commands") return schema();
   if (parsed.positionals[0] === "setup") return setup();
   const normalized = normalizeCommand(parsed);
-  const result = await request(normalized.command, normalized.params);
-  return normalized.params.file ? writeResultFile(result, normalized.params.file, normalized.command) : result;
+  OUTPUT_OPTIONS = normalized.params;
+  if (normalized.command === "doctor") {
+    normalized.params.cliVersion = VERSION;
+    normalized.params.timeout ??= 5_000;
+  }
+  let result;
+  try {
+    result = normalized.command === "snapshot-diff" ? await snapshotDiff(normalized.params) : await request(normalized.command, normalized.params);
+  } catch (error) {
+    if (normalized.command !== "doctor") throw error;
+    return {
+      ok: false,
+      versions: { cli: VERSION, nativeHost: null, extension: null, protocol: null },
+      checks: [{ name: "bridge-request", ok: false, detail: error.message, recovery: "Run chrome-bridge setup, load or reload the unpacked extension, then retry doctor." }],
+    };
+  }
+  result = shapeResult(result, normalized.params);
+  const resultFile = normalized.params.out || (normalized.command === "upload-file" ? undefined : normalized.params.file);
+  if (resultFile && ["screenshot", "performance-trace", "page-mhtml"].includes(normalized.command) && [normalized.params.fields, normalized.params.jq, normalized.params.maxResults, normalized.params.ndjson, normalized.params.compact].some((value) => value !== undefined && value !== false)) {
+    throw new Error(`Output shaping cannot be combined with a raw ${normalized.command} artifact`);
+  }
+  return resultFile ? writeResultFile(result, resultFile, normalized.command, normalized.params) : result;
 }
 
 const entrypoint = process.argv[1] ? await realpath(process.argv[1]).catch(() => path.resolve(process.argv[1])) : "";
 if (fileURLToPath(import.meta.url) === entrypoint) {
   main().then((result) => {
-    if (result !== undefined) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    if (result !== undefined) process.stdout.write(`${serializeResult(result)}\n`);
   }, (error) => {
-    process.stderr.write(`${JSON.stringify({ error: error.message })}\n`);
+    process.stderr.write(`${JSON.stringify({ error: error.message, details: error.details }, null, 2)}\n`);
     process.exitCode = 1;
   });
 }
