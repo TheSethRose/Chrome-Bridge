@@ -1,3 +1,5 @@
+import { normalizeSemanticValue, selectSemanticMatch, semanticNodeMatches } from "./semantic.js";
+
 const HOST_NAME = "dev.sethrose.chrome_bridge";
 const PROTOCOL_VERSION = "1.3";
 const REQUIRED_PERMISSIONS = ["bookmarks", "cookies", "debugger", "downloads", "history", "management", "nativeMessaging", "sessions", "sidePanel", "storage", "tabGroups", "tabs", "topSites", "webNavigation"];
@@ -521,11 +523,14 @@ async function executeCommand(command, params, requestId) {
       case "eval":
         result = await evaluate(tab, owner, params);
         break;
+      case "extract":
+        result = await extractPage(tab.id, owner, params);
+        break;
       case "click":
         result = await click(tab.id, owner, params);
         break;
       case "type":
-        result = await typeText(tab.id, owner, params.selector, params.text);
+        result = await typeText(tab.id, owner, params);
         break;
       case "type-text":
         result = await typeFocused(tab.id, owner, params);
@@ -718,7 +723,8 @@ function navigableUrl(value) {
 }
 
 async function waitForAction(tabId, owner, params) {
-  if (!params.wait && !params.waitForUrl && !params.waitForSelector) return null;
+  const hasSemanticWait = Boolean(params.waitRole || params.waitName || params.waitText);
+  if (!params.wait && !params.waitForUrl && !params.waitForSelector && !hasSemanticWait) return null;
   const timeout = durationMs(params.waitTimeout, 30_000);
   const deadline = Date.now() + timeout;
   while (Date.now() <= deadline) {
@@ -735,7 +741,20 @@ async function waitForAction(tabId, owner, params) {
   if (params.waitForSelector) {
     selector = await waitForPage(tabId, owner, { selector: params.waitForSelector, duration: Math.max(0, deadline - Date.now()) });
   }
-  return { matched: true, elapsedMs: timeout - Math.max(0, deadline - Date.now()), selector };
+  let semantic;
+  if (hasSemanticWait) {
+    semantic = await waitForPage(tabId, owner, {
+      role: params.waitRole,
+      name: params.waitName,
+      targetText: params.waitText,
+      state: params.waitState,
+      exact: params.waitExact,
+      nth: params.waitNth,
+      within: params.waitWithin,
+      duration: Math.max(0, deadline - Date.now()),
+    });
+  }
+  return { matched: true, elapsedMs: timeout - Math.max(0, deadline - Date.now()), selector, semantic };
 }
 
 async function observeTab(tabId, beforeUrl, duration = 1_500) {
@@ -846,49 +865,131 @@ async function doctor(tab, owner, params) {
 
 async function locateElements(tabId, owner, params) {
   return withDebugger(tabId, owner, async (target) => {
-    await Promise.all([cdp(target, "Accessibility.enable"), cdp(target, "DOM.enable")]);
-    const { nodes = [] } = await cdp(target, "Accessibility.getFullAXTree");
-    const role = String(params.role || "").toLowerCase();
-    const name = String(params.name || "").toLowerCase();
-    const text = String(params.text || "").toLowerCase();
-    const candidates = nodes.filter((node) => {
-      const nodeRole = String(node.role?.value || "").toLowerCase();
-      const nodeName = String(node.name?.value || "").toLowerCase();
-      const searchable = `${nodeName} ${node.value?.value || ""} ${node.description?.value || ""}`.toLowerCase();
-      return node.backendDOMNodeId && (!role || nodeRole === role) && (!name || nodeName.includes(name)) && (!text || searchable.includes(text));
-    }).slice(0, params.maxResults === undefined ? 50 : Math.max(0, Number(params.maxResults)));
-    const matches = [];
-    for (const candidate of candidates) {
-      const resolved = await cdp(target, "DOM.resolveNode", { backendNodeId: candidate.backendDOMNodeId }).catch(() => null);
-      if (!resolved?.object?.objectId) continue;
-      try {
-        const details = await cdp(target, "Runtime.callFunctionOn", {
-          objectId: resolved.object.objectId,
-          returnByValue: true,
-          functionDeclaration: `function() {
-            const el=this, unique=s=>{try{return document.querySelectorAll(s).length===1}catch{return false}}, esc=CSS.escape;
-            const generated=v=>/[a-f0-9]{8,}|(?:^|[-_])\\d{4,}|css-[a-z0-9]{5,}/i.test(v||'');
-            const candidates=[];
-            for(const attr of ['data-testid','data-test','name','aria-label']){const value=el.getAttribute?.(attr);if(value)candidates.push({selector:el.tagName.toLowerCase()+'['+attr+'="'+esc(value)+'"]',stable:true});}
-            if(el.id)candidates.unshift({selector:'#'+esc(el.id),stable:!generated(el.id)});
-            let chosen=candidates.find(item=>unique(item.selector));
-            if(!chosen){let node=el,parts=[];while(node&&node.nodeType===1&&parts.length<6){let part=node.tagName.toLowerCase();const siblings=[...(node.parentElement?.children||[])].filter(item=>item.tagName===node.tagName);if(siblings.length>1)part+=':nth-of-type('+(siblings.indexOf(node)+1)+')';parts.unshift(part);const selector=parts.join(' > ');if(unique(selector)){chosen={selector,stable:false};break;}node=node.parentElement;}}
-            const rect=el.getBoundingClientRect(), style=getComputedStyle(el), className=typeof el.className==='string'?el.className:'';
-            return {selector:chosen?.selector||null,selectorStable:Boolean(chosen?.stable),generated:generated(el.id)||generated(className),visible:rect.width>0&&rect.height>0&&style.visibility!=='hidden'&&style.display!=='none',enabled:!el.disabled&&el.getAttribute?.('aria-disabled')!=='true',tag:el.tagName,coordinates:{x:rect.left+rect.width/2,y:rect.top+rect.height/2}};
-          }`,
-        });
-        matches.push({
-          backendNodeId: candidate.backendDOMNodeId,
-          role: candidate.role?.value,
-          name: candidate.name?.value,
-          ...details.result?.value,
-        });
-      } finally {
-        await cdp(target, "Runtime.releaseObject", { objectId: resolved.object.objectId }).catch(() => {});
-      }
+    let { matches } = await semanticMatches(target, params, params.maxResults === undefined ? 50 : Math.max(0, Number(params.maxResults)));
+    if (params.nth !== undefined) {
+      const selected = selectSemanticMatch(matches, params.nth);
+      matches = selected.outcome === "match" ? [selected.match] : [];
     }
     return { tabId, url: (await chrome.tabs.get(tabId)).url || "", matches };
   });
+}
+
+function semanticQuery(params) {
+  return {
+    role: String(params.role || ""),
+    name: String(params.name || ""),
+    text: String(params.targetText ?? params.text ?? ""),
+    exact: Boolean(params.exact),
+    nth: params.nth,
+    within: params.within,
+  };
+}
+
+function hasSemanticTarget(params) {
+  const query = semanticQuery(params);
+  return Boolean(query.role || query.name || query.text);
+}
+
+async function semanticScopeBackendIds(target, selectorValue) {
+  if (!selectorValue) return null;
+  const selector = checkedSelector(selectorValue);
+  const { root } = await cdp(target, "DOM.getDocument", { depth: -1, pierce: true });
+  const { nodeId } = await cdp(target, "DOM.querySelector", { nodeId: root.nodeId, selector });
+  if (!nodeId) throw new Error(`Semantic scope not found: ${selector}`);
+  const { node } = await cdp(target, "DOM.describeNode", { nodeId, depth: -1, pierce: true });
+  const ids = new Set();
+  const collect = (current) => {
+    if (!current) return;
+    if (current.backendNodeId) ids.add(current.backendNodeId);
+    for (const child of current.children || []) collect(child);
+    collect(current.contentDocument);
+    for (const shadow of current.shadowRoots || []) collect(shadow);
+  };
+  collect(node);
+  return ids;
+}
+
+async function describeSemanticNodes(target, nodes) {
+  const matches = [];
+  for (const candidate of nodes) {
+    const resolved = await cdp(target, "DOM.resolveNode", { backendNodeId: candidate.backendDOMNodeId }).catch(() => null);
+    if (!resolved?.object?.objectId) continue;
+    try {
+      const details = await cdp(target, "Runtime.callFunctionOn", {
+        objectId: resolved.object.objectId,
+        returnByValue: true,
+        functionDeclaration: `function() {
+          const el=this, unique=s=>{try{return document.querySelectorAll(s).length===1}catch{return false}}, esc=CSS.escape;
+          const generated=v=>/[a-f0-9]{8,}|(?:^|[-_])\\d{4,}|css-[a-z0-9]{5,}/i.test(v||'');
+          const candidates=[];
+          for(const attr of ['data-testid','data-test','name','aria-label']){const value=el.getAttribute?.(attr);if(value)candidates.push({selector:el.tagName.toLowerCase()+'['+attr+'="'+esc(value)+'"]',stable:true});}
+          if(el.id)candidates.unshift({selector:'#'+esc(el.id),stable:!generated(el.id)});
+          let chosen=candidates.find(item=>unique(item.selector));
+          if(!chosen){let node=el,parts=[];while(node&&node.nodeType===1&&parts.length<6){let part=node.tagName.toLowerCase();const siblings=[...(node.parentElement?.children||[])].filter(item=>item.tagName===node.tagName);if(siblings.length>1)part+=':nth-of-type('+(siblings.indexOf(node)+1)+')';parts.unshift(part);const selector=parts.join(' > ');if(unique(selector)){chosen={selector,stable:false};break;}node=node.parentElement;}}
+          const rect=el.getBoundingClientRect(), style=getComputedStyle(el), className=typeof el.className==='string'?el.className:'';
+          return {selector:chosen?.selector||null,selectorStable:Boolean(chosen?.stable),generated:generated(el.id)||generated(className),visible:rect.width>0&&rect.height>0&&style.visibility!=='hidden'&&style.display!=='none'&&style.opacity!=='0',enabled:!el.disabled&&el.getAttribute?.('aria-disabled')!=='true',tag:el.tagName,coordinates:{x:rect.left+rect.width/2,y:rect.top+rect.height/2}};
+        }`,
+      });
+      matches.push({
+        backendNodeId: candidate.backendDOMNodeId,
+        role: candidate.role?.value,
+        name: candidate.name?.value,
+        value: candidate.value?.value,
+        description: candidate.description?.value,
+        ...details.result?.value,
+      });
+    } finally {
+      await cdp(target, "Runtime.releaseObject", { objectId: resolved.object.objectId }).catch(() => {});
+    }
+  }
+  return matches;
+}
+
+async function semanticMatches(target, params, limit = 50, includeNearby = true) {
+  await Promise.all([cdp(target, "Accessibility.enable"), cdp(target, "DOM.enable")]);
+  const [{ nodes = [] }, scope] = await Promise.all([
+    cdp(target, "Accessibility.getFullAXTree"),
+    semanticScopeBackendIds(target, params.within),
+  ]);
+  const query = semanticQuery(params);
+  const role = normalizeSemanticValue(query.role);
+  const matching = nodes.filter((node) => {
+    if (!node.backendDOMNodeId || (scope && !scope.has(node.backendDOMNodeId))) return false;
+    return semanticNodeMatches(node, query);
+  });
+  const uniqueMatching = [...new Map(matching.map((node) => [node.backendDOMNodeId, node])).values()];
+  const fallback = uniqueMatching.length || !includeNearby ? [] : nodes.filter((node) => (
+    node.backendDOMNodeId
+    && (!scope || scope.has(node.backendDOMNodeId))
+    && (!role || normalizeSemanticValue(node.role?.value) === role)
+    && (node.name?.value || node.value?.value)
+  )).slice(0, 10);
+  const [matches, nearby] = await Promise.all([
+    describeSemanticNodes(target, uniqueMatching.slice(0, limit)),
+    describeSemanticNodes(target, fallback),
+  ]);
+  return { query, matches, nearby };
+}
+
+async function resolveSemanticTarget(target, params) {
+  const { query, matches, nearby } = await semanticMatches(target, params);
+  const selected = selectSemanticMatch(matches, params.nth);
+  if (selected.outcome === "no-match") {
+    throw commandError("No semantic target matched", { outcome: "no-match", query, candidates: nearby });
+  }
+  if (selected.outcome === "ambiguous") {
+    throw commandError(`Semantic target is ambiguous (${matches.length} matches)`, {
+      outcome: "ambiguous",
+      query,
+      count: matches.length,
+      candidates: matches.slice(0, 10),
+      recovery: "Add --exact, --within, or --nth=N.",
+    });
+  }
+  if (selected.outcome === "out-of-range") {
+    throw commandError(`Semantic match index ${params.nth} is out of range`, { outcome: "no-match", query, count: matches.length, candidates: matches.slice(0, 10) });
+  }
+  return selected.match;
 }
 
 function globRegex(value) {
@@ -1026,14 +1127,21 @@ async function screenshot(tabId, owner, params) {
     await cdp(target, "Page.enable");
     const format = params.format === "jpeg" ? "jpeg" : "png";
     let clip;
-    if (params.selector) {
-      const selector = checkedSelector(params.selector);
-      const measured = await cdp(target, "Runtime.evaluate", {
-        expression: `(() => { const el=document.querySelector(${JSON.stringify(selector)}); if(!el) throw new Error('Element not found'); el.scrollIntoView({block:'center',inline:'center'}); const r=el.getBoundingClientRect(); return {x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1}; })()`,
-        returnByValue: true,
-      });
-      if (measured.exceptionDetails) throw new Error(measured.exceptionDetails.exception?.description || "Element screenshot failed");
-      clip = measured.result.value;
+    let resolvedTarget;
+    if (params.selector || hasSemanticTarget(params)) {
+      const resolved = await resolveTargetObject(target, params);
+      resolvedTarget = resolved.target;
+      try {
+        const measured = await cdp(target, "Runtime.callFunctionOn", {
+          objectId: resolved.objectId,
+          returnByValue: true,
+          functionDeclaration: "function(){this.scrollIntoView({block:'center',inline:'center'});const r=this.getBoundingClientRect();return{x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1};}",
+        });
+        if (measured.exceptionDetails) throw new Error(measured.exceptionDetails.exception?.description || "Element screenshot failed");
+        clip = measured.result.value;
+      } finally {
+        await cdp(target, "Runtime.releaseObject", { objectId: resolved.objectId }).catch(() => {});
+      }
     }
     const result = await cdp(target, "Page.captureScreenshot", {
       format,
@@ -1041,7 +1149,7 @@ async function screenshot(tabId, owner, params) {
       captureBeyondViewport: params.fullPage !== false,
       clip,
     });
-    return { data: result.data, format, tabId, url: (await chrome.tabs.get(tabId)).url || "" };
+    return { data: result.data, format, tabId, url: (await chrome.tabs.get(tabId)).url || "", target: resolvedTarget };
   });
 }
 
@@ -1084,6 +1192,39 @@ async function evaluate(tab, owner, params) {
   });
 }
 
+async function extractPage(tabId, owner, params) {
+  const item = checkedSelector(params.item);
+  const within = params.within ? checkedSelector(params.within) : null;
+  const schema = jsonValue(params.schema, {});
+  if (!schema || typeof schema !== "object" || Array.isArray(schema) || !Object.keys(schema).length) throw new Error("extract requires --schema as a non-empty JSON object");
+  const limit = Math.max(0, Math.min(1_000, Number(params.limit ?? 100)));
+  return withDebugger(tabId, owner, async (target) => {
+    const result = await cdp(target, "Runtime.evaluate", {
+      expression: `(() => {
+        const itemSelector=${JSON.stringify(item)}, withinSelector=${JSON.stringify(within)}, schema=${JSON.stringify(schema)}, limit=${limit};
+        const root=withinSelector?document.querySelector(withinSelector):document;
+        if(!root) throw new Error('Extraction scope not found: '+withinSelector);
+        const nodes=[...root.querySelectorAll(itemSelector)];
+        const read=(item,specValue)=>{
+          const spec=typeof specValue==='string'?{selector:specValue}:specValue||{};
+          let node=spec.selector?item.querySelector(spec.selector):item;
+          if(spec.closest) node=node?.closest(spec.closest);
+          if(!node) return null;
+          if(spec.attribute) return node.getAttribute(spec.attribute);
+          const property=spec.property||'innerText';
+          const value=node[property];
+          return value===undefined?node.getAttribute(property):value;
+        };
+        const items=nodes.slice(0,limit).map(item=>Object.fromEntries(Object.entries(schema).map(([key,spec])=>[key,read(item,spec)])));
+        return {items,total:nodes.length,returned:items.length,limited:items.length<nodes.length,url:location.href};
+      })()`,
+      returnByValue: true,
+    });
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "Extraction failed");
+    return result.result?.value;
+  });
+}
+
 function checkedSelector(value) {
   const selector = String(value || "");
   if (!selector) throw new Error("A selector is required");
@@ -1098,6 +1239,31 @@ async function elementPoint(target, selectorValue) {
   });
   if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "Element lookup failed");
   return result.result.value;
+}
+
+async function resolveTargetObject(target, params) {
+  let result;
+  let metadata;
+  if (params.selector) {
+    const selector = checkedSelector(params.selector);
+    result = await cdp(target, "Runtime.evaluate", { expression: `document.querySelector(${JSON.stringify(selector)})`, returnByValue: false });
+    metadata = { selector };
+  } else {
+    metadata = hasSemanticTarget(params) ? await resolveSemanticTarget(target, params) : { backendNodeId: Number(params.backendNodeId) };
+    result = await cdp(target, "DOM.resolveNode", { backendNodeId: metadata.backendNodeId }).catch(() => null);
+  }
+  if (!result?.result?.objectId && !result?.object?.objectId) throw new Error("Target element was not found or is stale");
+  return { objectId: result.result?.objectId || result.object.objectId, target: metadata };
+}
+
+async function targetPoint(target, params) {
+  if (params.selector) return { point: await elementPoint(target, params.selector), target: { selector: params.selector } };
+  if (params.backendNodeId !== undefined) return { point: await backendNodePoint(target, params.backendNodeId), target: { backendNodeId: Number(params.backendNodeId) } };
+  if (hasSemanticTarget(params)) {
+    const semantic = await resolveSemanticTarget(target, params);
+    return { point: await backendNodePoint(target, semantic.backendNodeId), target: semantic };
+  }
+  return { point: { x: Number(params.x), y: Number(params.y) }, target: { x: Number(params.x), y: Number(params.y) } };
 }
 
 async function backendNodePoint(target, backendNodeIdValue) {
@@ -1130,16 +1296,13 @@ async function backendNodePoint(target, backendNodeIdValue) {
 async function click(tabId, owner, params) {
   const before = await chrome.tabs.get(tabId);
   let point;
+  let resolvedTarget;
   let pressed = false;
   const clickCount = params.double ? 2 : 1;
   let outcome = "success";
   try {
     await withDebugger(tabId, owner, async (target) => {
-      point = params.selector
-        ? await elementPoint(target, params.selector)
-        : params.backendNodeId !== undefined
-          ? await backendNodePoint(target, params.backendNodeId)
-          : { x: Number(params.x), y: Number(params.y) };
+      ({ point, target: resolvedTarget } = await targetPoint(target, params));
       if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) throw new Error("click requires --selector, --backend-node-id, or numeric --x and --y");
       await cdp(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount });
       pressed = true;
@@ -1163,20 +1326,28 @@ async function click(tabId, owner, params) {
     beforeUrl: before.url || "",
     lastKnownUrl: current.url || "",
     title: current.title || "",
+    target: resolvedTarget,
     wait: waitResult || undefined,
     recommendedAction: outcome === "unknown" ? "inspect-current-state" : undefined,
   };
 }
 
-async function typeText(tabId, owner, selectorValue, textValue) {
-  const selector = checkedSelector(selectorValue);
-  const text = String(textValue ?? "");
+async function typeText(tabId, owner, params) {
+  const text = String(params.text ?? "");
   return withDebugger(tabId, owner, async (target) => {
-    const expression = `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) throw new Error('Element not found'); el.focus(); if ('select' in el) el.select(); else if (el.isContentEditable) document.execCommand('selectAll'); return {tag:el.tagName}; })()`;
-    const focused = await cdp(target, "Runtime.evaluate", { expression, returnByValue: true });
-    if (focused.exceptionDetails) throw new Error(focused.exceptionDetails.exception?.description || "Type failed");
-    await cdp(target, "Input.insertText", { text });
-    return { ...focused.result?.value, length: text.length };
+    const resolved = await resolveTargetObject(target, { ...params, text: params.targetText });
+    try {
+      const focused = await cdp(target, "Runtime.callFunctionOn", {
+        objectId: resolved.objectId,
+        returnByValue: true,
+        functionDeclaration: "function(){this.focus();if('select' in this)this.select();else if(this.isContentEditable)document.execCommand('selectAll');return{tag:this.tagName};}",
+      });
+      if (focused.exceptionDetails) throw new Error(focused.exceptionDetails.exception?.description || "Type failed");
+      await cdp(target, "Input.insertText", { text });
+      return { ...focused.result?.value, length: text.length, target: resolved.target };
+    } finally {
+      await cdp(target, "Runtime.releaseObject", { objectId: resolved.objectId }).catch(() => {});
+    }
   });
 }
 
@@ -1190,10 +1361,10 @@ async function typeFocused(tabId, owner, params) {
 
 async function hover(tabId, owner, params) {
   return withDebugger(tabId, owner, async (target) => {
-    const point = params.selector ? await elementPoint(target, params.selector) : { x: Number(params.x), y: Number(params.y) };
+    const { point, target: resolvedTarget } = await targetPoint(target, params);
     if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) throw new Error("hover requires --selector or numeric --x and --y");
     await cdp(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y });
-    return point;
+    return { ...point, target: resolvedTarget };
   });
 }
 
@@ -1271,27 +1442,43 @@ async function fillForm(tabId, owner, params) {
   const elements = jsonValue(params.elements, []);
   if (!Array.isArray(elements) || !elements.length) throw new Error("fill-form requires --elements as a JSON array");
   return withDebugger(tabId, owner, async (target) => {
-    const result = await cdp(target, "Runtime.evaluate", {
-      expression: `(() => { const items=${JSON.stringify(elements)}; return items.map(({selector,value}) => { const el=document.querySelector(selector); if(!el) throw new Error('Element not found: '+selector); if(el.type==='checkbox'||el.type==='radio') el.checked=value===true||value==='true'; else if(el.tagName==='SELECT') el.value=String(value); else el.value=String(value); el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); return {selector,tag:el.tagName}; }); })()`,
-      returnByValue: true,
-    });
-    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "Form fill failed");
-    return result.result.value;
+    const filled = [];
+    for (const item of elements) {
+      if (!item || typeof item !== "object" || (!item.selector && !hasSemanticTarget(item))) throw new Error("Each fill-form item requires selector, role, name, or text");
+      const resolved = await resolveTargetObject(target, item);
+      try {
+        const result = await cdp(target, "Runtime.callFunctionOn", {
+          objectId: resolved.objectId,
+          arguments: [{ value: item.value }],
+          returnByValue: true,
+          functionDeclaration: `function(value) {
+            if(this.type==='checkbox'||this.type==='radio') this.checked=value===true||value==='true';
+            else this.value=String(value??'');
+            this.dispatchEvent(new Event('input',{bubbles:true}));
+            this.dispatchEvent(new Event('change',{bubbles:true}));
+            return {tag:this.tagName};
+          }`,
+        });
+        if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "Form fill failed");
+        filled.push({ ...result.result?.value, selector: item.selector, target: resolved.target });
+      } finally {
+        await cdp(target, "Runtime.releaseObject", { objectId: resolved.objectId }).catch(() => {});
+      }
+    }
+    return filled;
   });
 }
 
 async function uploadFile(tabId, owner, params) {
-  const selector = checkedSelector(params.selector);
   const files = jsonValue(params.files, params.file ? [params.file] : []);
   if (!Array.isArray(files) || !files.length) throw new Error("upload-file requires --file or --files");
   return withDebugger(tabId, owner, async (target) => {
-    const found = await cdp(target, "Runtime.evaluate", { expression: `document.querySelector(${JSON.stringify(selector)})`, returnByValue: false });
-    if (!found.result?.objectId) throw new Error("File input not found");
+    const resolved = await resolveTargetObject(target, params);
     try {
-      await cdp(target, "DOM.setFileInputFiles", { objectId: found.result.objectId, files: files.map(String) });
-      return { selector, files };
+      await cdp(target, "DOM.setFileInputFiles", { objectId: resolved.objectId, files: files.map(String) });
+      return { selector: params.selector, target: resolved.target, files };
     } finally {
-      await cdp(target, "Runtime.releaseObject", { objectId: found.result.objectId }).catch(() => {});
+      await cdp(target, "Runtime.releaseObject", { objectId: resolved.objectId }).catch(() => {});
     }
   });
 }
@@ -1299,7 +1486,8 @@ async function uploadFile(tabId, owner, params) {
 async function waitForPage(tabId, owner, params) {
   const timeout = durationMs(params.duration ?? params.waitTimeout, 30_000);
   const deadline = Date.now() + timeout;
-  const expression = params.expression
+  const semantic = Boolean(params.role || params.name || params.targetText);
+  const expression = semantic ? null : params.expression
     ? `Boolean(${params.expression})`
     : params.selector
       ? `Boolean(document.querySelector(${JSON.stringify(String(params.selector))}))`
@@ -1316,9 +1504,38 @@ async function waitForPage(tabId, owner, params) {
             await sleep(100);
             continue;
           }
-          const result = await cdp(target, "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
-          if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "Wait expression failed");
-          if (result.result?.value) return { matched: true, elapsedMs: timeout - Math.max(0, deadline - Date.now()) };
+          if (semantic) {
+            const semanticParams = { ...params, text: params.targetText };
+            const { query, matches } = await semanticMatches(target, semanticParams, 50, false);
+            const state = params.state || "attached";
+            if (state === "hidden" && (!matches.length || matches.every((match) => !match.visible))) {
+              return { matched: true, elapsedMs: timeout - Math.max(0, deadline - Date.now()), target: null, query };
+            }
+            if (matches.length) {
+              const selected = selectSemanticMatch(matches, params.nth);
+              if (selected.outcome === "ambiguous") {
+                throw commandError(`Semantic target is ambiguous (${matches.length} matches)`, {
+                  outcome: "ambiguous", query, count: matches.length, candidates: matches.slice(0, 10), recovery: "Add --exact, --within, or --nth=N.",
+                });
+              }
+              if (selected.outcome === "out-of-range") {
+                throw commandError(`Semantic match index ${params.nth} is out of range`, { outcome: "no-match", query, count: matches.length, candidates: matches.slice(0, 10) });
+              }
+              const match = selected.match;
+              const stateMatched = state === "attached"
+                || (state === "visible" && match.visible)
+                || (state === "enabled" && match.enabled)
+                || (state === "disabled" && !match.enabled);
+              if (stateMatched) return { matched: true, elapsedMs: timeout - Math.max(0, deadline - Date.now()), target: match };
+            } else if (state !== "hidden" && Date.now() + 100 > deadline) {
+              const { nearby } = await semanticMatches(target, semanticParams, 50, true);
+              throw commandError(`Semantic condition did not match within ${timeout}ms`, { outcome: "no-match", query, candidates: nearby });
+            }
+          } else {
+            const result = await cdp(target, "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
+            if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || "Wait expression failed");
+            if (result.result?.value) return { matched: true, elapsedMs: timeout - Math.max(0, deadline - Date.now()) };
+          }
           await sleep(100);
         }
         throw new Error(`Condition did not match within ${timeout}ms`);

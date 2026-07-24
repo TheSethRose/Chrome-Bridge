@@ -6,6 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { normalizeCommand, parseArguments, parseDuration } from "./bin/chrome-bridge.mjs";
+import { normalizeSemanticValue, selectSemanticMatch, semanticNodeMatches } from "./extension/semantic.js";
 import { decodeNativeMessages, encodeNativeMessage } from "./native-host/host.mjs";
 import { COMMANDS, schema } from "./shared/commands.mjs";
 
@@ -128,6 +129,7 @@ for (const documented of [
   "click", "hover", "drag", "type", "type-text", "press-key", "fill-form", "upload-file", "wait-for", "handle-dialog",
   "network capture", "network start", "network tail", "network get-body", "network stop", "network export-har", "console capture",
   "scripts list", "scripts get", "resources tree", "resources get", "page mhtml", "cookies", "storage", "targets",
+  "extract",
   "performance metrics", "performance profile", "performance trace", "resize", "emulate",
   "history search", "bookmarks tree", "bookmarks search", "downloads search", "extensions list", "extension reload", "chrome call",
   "cdp send", "cdp events", "cdp session-start", "cdp session-stop",
@@ -146,7 +148,7 @@ for (const command of [
   "dom-snapshot", "performance-trace", "history-search", "bookmarks-tree", "downloads-search", "cdp-send",
   "new-tab", "close-tab", "go-forward", "hover", "drag", "press-key", "fill-form", "upload-file",
   "wait-for", "handle-dialog", "resize", "emulate", "screencast", "cdp-session-start", "cdp-session-stop",
-  "inspectability", "doctor",
+  "inspectability", "doctor", "extract",
 ]) {
   assert.ok(background.includes(`case "${command}"`), `missing command handler ${command}`);
 }
@@ -154,6 +156,8 @@ assert.match(background, /Target\.setAutoAttach/);
 assert.match(background, /manualCdpSessions/);
 assert.match(background, /chrome\[namespace\]/);
 assert.match(background, /backendNodePoint/);
+assert.match(background, /resolveSemanticTarget/);
+assert.match(background, /extractPage/);
 assert.match(background, /sideEffectMayHaveOccurred/);
 assert.match(background, /initialLoadCaptured/);
 assert.match(background, /waitForNetworkIdle/);
@@ -193,6 +197,29 @@ assert.deepEqual(normalizeCommand(parseArguments(["click", "--tab=3", "--backend
   command: "click",
   params: { tab: 3, backendNodeId: 456, waitForUrl: "/analytics" },
 });
+assert.deepEqual(normalizeCommand(parseArguments(["click", "--tab=3", "--role=tab", "--name=Top", "--wait-role=status", "--wait-name=Loaded"])), {
+  command: "click",
+  params: { tab: 3, role: "tab", name: "Top", waitRole: "status", waitName: "Loaded" },
+});
+assert.deepEqual(normalizeCommand(parseArguments(["wait-for", "--tab=3", "--role=button", "--name=Publish", "--state=enabled"])), {
+  command: "wait-for",
+  params: { tab: 3, role: "button", name: "Publish", state: "enabled" },
+});
+assert.deepEqual(normalizeCommand(parseArguments(["type", "--tab=3", "--role=textbox", "--name=Search", "--text=query"])), {
+  command: "type",
+  params: { tab: 3, role: "textbox", name: "Search", text: "query" },
+});
+assert.deepEqual(normalizeCommand(parseArguments(["extract", "--tab=3", "--item=article", "--schema={\"text\":{\"property\":\"innerText\"}}"])), {
+  command: "extract",
+  params: { tab: 3, item: "article", schema: "{\"text\":{\"property\":\"innerText\"}}" },
+});
+const semanticNode = { role: { value: "button" }, name: { value: "  Save   changes " }, value: { value: "" }, description: { value: "Submit form" } };
+assert.equal(normalizeSemanticValue(semanticNode.name.value), "save changes");
+assert.equal(semanticNodeMatches(semanticNode, { role: "button", name: "save", text: "", exact: false }), true);
+assert.equal(semanticNodeMatches(semanticNode, { role: "button", name: "save", text: "", exact: true }), false);
+assert.equal(semanticNodeMatches(semanticNode, { role: "button", name: "", text: "Submit form", exact: true }), true);
+assert.deepEqual(selectSemanticMatch([{ id: 1 }, { id: 2 }]), { outcome: "ambiguous" });
+assert.deepEqual(selectSemanticMatch([{ id: 1 }, { id: 2 }], 1), { outcome: "match", index: 1, match: { id: 2 } });
 assert.deepEqual(normalizeCommand(parseArguments(["console", "tail", "--tab=3", "--duration=1s"])), {
   command: "console-capture",
   params: { tab: 3, duration: 1_000 },
@@ -205,7 +232,7 @@ assert.deepEqual(normalizeCommand(parseArguments(["watch", "--tab=3", "--request
   command: "watch",
   params: { tab: 3, request: "*/graphql", duration: 30_000 },
 });
-assert.throws(() => normalizeCommand(parseArguments(["click", "--tab=3"])), /click requires a target[\s\S]*--backend-node-id/);
+assert.throws(() => normalizeCommand(parseArguments(["click", "--tab=3"])), /click requires a target[\s\S]*--role/);
 assert.throws(() => normalizeCommand(parseArguments(["reload"])), /requires an explicit --tab=ID/);
 assert.throws(() => normalizeCommand(parseArguments(["snapshot", "--max-node=10"])), /Did you mean --max-nodes/);
 assert.throws(() => normalizeCommand(parseArguments(["watch", "--tab=3", "--url-changes", "--selector=main"])), /exactly one/);

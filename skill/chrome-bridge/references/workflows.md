@@ -6,14 +6,23 @@ Use these combinations when one command is insufficient. Replace IDs and selecto
 
 ```bash
 chrome-bridge capabilities --tab=3
-chrome-bridge locate --tab=3 --role=button --name='Save changes'
 chrome-bridge snapshot --tab=3 --compact --file=/tmp/before.json
-chrome-bridge click --tab=3 --backend-node-id=NODE_ID --wait-for-selector='.success' --wait-timeout=15s
+chrome-bridge click --tab=3 --role=button --name='Save changes' --wait-role=status --wait-name=Saved --wait-timeout=15s
 chrome-bridge snapshot --tab=3 --compact --file=/tmp/after.json
 chrome-bridge snapshot diff --before=/tmp/before.json --after=/tmp/after.json --compact
 ```
 
-Prefer a stable `data-testid`, accessible label, name, or semantic selector. Verify an external action from a success toast, cleared composer, changed URL, resulting DOM, or captured request.
+Semantic actions resolve and act in one debugger attachment. Zero matches return nearby candidates; multiple matches fail until `--exact`, `--within`, or zero-based `--nth` identifies one. Verify an external action from a semantic status, cleared composer, changed URL, resulting DOM, or captured request.
+
+## Extract repeated records
+
+```bash
+chrome-bridge extract --tab=3 --within=main --item='article' \
+  --schema='{"author":{"selector":"[data-testid=User-Name]","property":"innerText"},"text":{"selector":"[data-testid=tweetText]","property":"innerText"},"url":{"selector":"time","closest":"a","property":"href"}}' \
+  --file=/tmp/articles.json
+```
+
+Use one item selector and a field schema instead of custom `eval` for repeated cards, rows, links, or search results. Results default to 100 records and never exceed 1,000 in one command.
 
 ## Discover a private API during a real action
 

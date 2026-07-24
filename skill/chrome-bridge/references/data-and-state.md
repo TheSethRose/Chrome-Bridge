@@ -36,7 +36,7 @@ The runtime also contains `config.json` for the extension ID and `state.json` fo
 
 | Need | Primary command/data | Important distinction |
 |---|---|---|
-| Human-visible page content | `visible-text` or `snapshot` | `visible-text` is plain text; `snapshot` adds roles, labels, values, and states for grounding. |
+| Human-visible page content | `visible-text`, `snapshot`, or `extract` | `visible-text` is plain text; `snapshot` adds semantic grounding; `extract` returns bounded structured records from repeated DOM items. |
 | Current page markup | `dom` | Reflects the live DOM after JavaScript mutations. |
 | Original or loaded source | `scripts list/get` or `resources tree/get` | Runtime script source and resource response content are different from serialized DOM. |
 | Full page archive | `page mhtml --file=...` | Preserves the document and resource payloads together. |
@@ -71,6 +71,8 @@ These IDs are not interchangeable:
 | Script ID | `scripts list` or `Debugger.scriptParsed` | Raw `Debugger.getScriptSource` | Runtime identifier for a parsed script; it can change after reload. |
 | Frame ID | `resources tree` | `resources get --frame` | CDP identifier for a document frame. |
 | Command ID | Audit/log entry | Native-host log filenames and side-panel expansion | UUID joining a CLI request, its response, and its audit metadata. |
+
+Semantic role/name/text targets are queries, not persistent identifiers. The bridge resolves them and performs the action during one debugger attachment, then returns the resolved backend node and page metadata for auditability.
 
 ## Network data lifecycle
 

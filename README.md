@@ -50,6 +50,9 @@ chrome-bridge tab name --tab=3 --name=research
 chrome-bridge capabilities --tab=research
 chrome-bridge new-tab 'https://example.com'
 chrome-bridge locate --tab=research --role=button --name='Save changes'
+chrome-bridge click --tab=research --role=button --name='Save changes' --wait-role=status --wait-name=Saved
+chrome-bridge wait-for --tab=research --role=button --name=Publish --state=enabled
+chrome-bridge extract --tab=research --item=article --schema='{"text":{"property":"innerText"},"url":{"selector":"a","property":"href"}}'
 chrome-bridge dom --tab=research --selector=main --fields=url,html --compact
 chrome-bridge visible-text --tab=3
 chrome-bridge eval --tab=3 'document.title'
@@ -67,7 +70,7 @@ chrome-bridge cdp send --tab=3 --method=Runtime.evaluate --params='{"expression"
 chrome-bridge chrome call --api=windows --method=getAll --args='[{"populate":true}]'
 ```
 
-The CLI has direct access to page data, browser data, real CDP mouse and keyboard input, dialogs, file upload, emulation, screencasts, evaluation, extension management, stateful debugger sessions, child targets, and every CDP method Chrome exposes to extensions. `chrome call` is the raw escape hatch for granted Chrome Extension APIs. Raw output can be shaped with `--fields`, `--jq`, `--max-results`, `--compact`, and `--ndjson`; saved files return a hash-bearing artifact receipt. Large requests and responses are chunked across native-messaging frames, so Chrome's per-message limits do not truncate the result.
+The CLI has direct access to page data, browser data, real CDP mouse and keyboard input, dialogs, file upload, emulation, screencasts, evaluation, extension management, stateful debugger sessions, child targets, and every CDP method Chrome exposes to extensions. Interaction commands can resolve accessibility roles, names, and text atomically; ambiguous matches fail with compact candidates unless `--exact`, `--within`, or zero-based `--nth` selects one. `extract` turns repeated DOM records into bounded JSON without custom page scripts. `chrome call` is the raw escape hatch for granted Chrome Extension APIs. Raw output can be shaped with `--fields`, `--jq`, `--max-results`, `--compact`, and `--ndjson`; saved files return a hash-bearing artifact receipt. Large requests and responses are chunked across native-messaging frames, so Chrome's per-message limits do not truncate the result.
 
 Chrome intentionally withholds some CDP domains from `chrome.debugger`, including browser-process and heap-profiler surfaces. No MV3 extension can bypass that platform boundary inside a normal Chrome profile; those commands require Chrome's separate remote-debugging connection and its browser-level consent. Chrome Bridge forwards any syntactically valid CDP method and reports Chrome's own error when the browser does not permit it.
 

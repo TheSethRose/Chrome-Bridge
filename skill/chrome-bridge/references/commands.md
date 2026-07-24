@@ -47,15 +47,16 @@ Read-only page commands accept `--tab=ID`; omit it only when the active tab is u
 |---|---|---|
 | `snapshot --tab=ID` | Ground controls and content semantically before interacting. | Accessibility nodes and backend DOM node IDs. Filter with `--selector`, `--role`, `--name`, `--depth`, or `--max-nodes`; `--compact` returns interaction-relevant fields. |
 | `snapshot diff --before=FILE --after=FILE` | Verify semantic changes between two saved JSON snapshots without contacting Chrome. | Added, removed, and changed paths plus counts, keyed by backend node ID when snapshots contain nodes. It does not retain or query live tab history. |
-| `locate --tab=ID` | Discover an element from visible text, role, or accessible name before acting. | Matches with accessible metadata, backend node IDs, visibility, enabled state, coordinates, suggested unique selectors, and stability warnings. |
+| `locate --tab=ID` | Discover an element from visible text, role, or accessible name before acting. | Matches with accessible metadata, backend node IDs, visibility, enabled state, coordinates, suggested unique selectors, and stability warnings. Add `--exact`, `--within=CSS`, or zero-based `--nth=N` to narrow the same resolver used by interaction commands. |
 | `watch --tab=ID` | Wait for `--url-changes`, `--selector`, `--request=GLOB`, or `--console=error|warning|all` without shell polling. | The matched state, events, and elapsed time; specify exactly one condition. Request and console watches need debugger access, so external DevTools blocks them; a request watch also fails when that tab already has a network capture. |
 | `dom --tab=ID` | Read the page's current rendered HTML after client-side changes. | Full live document HTML, or one subtree with `--selector`. |
 | `dom snapshot --tab=ID` | Analyze layout, paint order, DOM rectangles, and selected computed styles at scale. | CDP `DOMSnapshot.captureSnapshot` documents, strings, layout nodes, text boxes, and computed-style indexes. Use `--styles=CSV` to choose properties. |
 | `visible-text --tab=ID` | Quickly read what the page visibly says without HTML or accessibility metadata. | `innerText` for the body or the element selected by `--selector`. |
 | `styles --tab=ID --selector=CSS` | Explain why one element looks or lays out a certain way. | Its DOM node ID, attributes, full computed style, inline style, matched rules, inherited rules, pseudo-element rules, and keyframes. |
-| `screenshot --tab=ID` | Capture visual evidence of the page or one element. | Base64 PNG or JPEG plus format and tab ID; with `--file`, writes the binary image. Use `--selector=CSS`, `--format=jpeg`, or `--quality=N` as needed. |
+| `screenshot --tab=ID` | Capture visual evidence of the page or one element. | Base64 PNG or JPEG plus format and tab ID; with `--file`, writes the binary image. Target an element with CSS or `--role`, `--name`, and `--text`; use `--format=jpeg` or `--quality=N` as needed. |
 | `screencast --tab=ID` | Capture a short sequence of rendered frames when motion or state transitions matter. | JSON containing CDP screencast frames and metadata. It does not transcode frames into a video. Options include duration, format, quality, dimensions, and frame sampling. |
 | `eval --tab=ID JAVASCRIPT` | Ask a narrow page-specific question or perform an operation not covered by a high-level command. | A CDP remote object, or its serializable value with `--value-only`. It awaits promises and surfaces JavaScript exceptions. |
+| `extract --tab=ID --item=CSS --schema=JSON` | Turn repeated page records into bounded JSON without custom JavaScript. | `{items,total,returned,limited,url}`. Each schema field may set `selector`, `closest`, `property`, or `attribute`; `--within=CSS` scopes the items and `--limit` defaults to 100 with a hard maximum of 1,000. |
 
 Choose `snapshot` for meaning, `dom` for current markup, `dom snapshot` for rendering internals, `visible-text` for a quick read, and `eval` for a targeted custom query.
 
@@ -63,18 +64,18 @@ Choose `snapshot` for meaning, `dom` for current markup, `dom snapshot` for rend
 
 | Command | Use it for | What it returns or changes |
 |---|---|---|
-| `click --tab=ID` | Click a grounded element or exact viewport coordinate with real CDP mouse events. | Target with `--backend-node-id` from `snapshot`, `--selector`, or `--x --y`. Returns outcome, side-effect ambiguity, before/final URLs, title, point, and optional atomic wait result. |
-| `hover --tab=ID` | Open hover menus, trigger tooltips, or inspect hover styles. | The final mouse point and element summary. Accepts a selector or coordinates. |
+| `click --tab=ID` | Click a grounded element or exact viewport coordinate with real CDP mouse events. | Target atomically with `--role`, `--name`, or `--text`, or use a backend node, selector, or coordinates. Zero matches include nearby candidates; multiple matches fail unless `--exact`, `--within`, or zero-based `--nth` resolves them. The result includes the resolved semantic target and optional semantic postcondition. |
+| `hover --tab=ID` | Open hover menus, trigger tooltips, or inspect hover styles. | The final mouse point and resolved target. Accepts role/name/text, a selector, or coordinates. |
 | `drag --tab=ID` | Perform an HTML drag-and-drop operation with intercepted CDP drag data. | Source and destination points after Chrome dispatches drag enter, over, and drop. Use source/destination selectors or coordinate pairs. |
-| `type --tab=ID --selector=CSS --text=TEXT` | Replace the contents of a specific input, textarea, or contenteditable element. | The element tag and inserted character count. It focuses and selects the target before inserting text. |
+| `type --tab=ID --text=TEXT` | Replace the contents of a specific input, textarea, or contenteditable element. | Target with CSS or `--role`/`--name`/`--target-text`; returns the resolved target, element tag, and inserted character count. |
 | `type-text --tab=ID --text=TEXT` | Continue typing into the element that is already focused. | The inserted character count. It does not locate or clear an element first. |
 | `press-key --tab=ID KEY` | Trigger shortcuts, submit forms, dismiss UI, or use navigation keys. | The normalized key, code, modifier mask, and virtual key code sent to Chrome. Accepts `Enter`, `Escape`, `Meta+A`, `Control+Shift+R`, and similar combinations. |
-| `fill-form --tab=ID --elements=JSON` | Fill several inputs, selects, checkboxes, or radios in one command. | An array identifying every selector and element tag changed. Each JSON item needs `selector` and `value`. |
-| `upload-file --tab=ID --selector=CSS` | Put local files into an existing `<input type=file>`. | The selector and file paths passed to Chrome. Use `--file=PATH` or `--files='["PATH1","PATH2"]'`; use `--out=PATH` for the result receipt. |
-| `wait-for --tab=ID` | Synchronize with a page condition instead of guessing with sleep. | `{matched:true, elapsedMs}` or a timeout error. Wait for `--selector`, `--text`, or a truthy `--expression`; set the maximum with `--duration`. |
+| `fill-form --tab=ID --elements=JSON` | Fill several inputs, selects, checkboxes, or radios in one command. | Each item supplies `value` plus a selector or semantic role/name/text target; the entire form resolves and fills under one debugger attachment. |
+| `upload-file --tab=ID` | Put local files into an existing `<input type=file>`. | Target with CSS or role/name/text, then use `--file=PATH` or `--files='["PATH1","PATH2"]'`; use `--out=PATH` for the result receipt. |
+| `wait-for --tab=ID` | Synchronize with a page condition instead of guessing with sleep. | Wait for a selector, page-text fragment, truthy expression, or semantic role/name/target-text in `attached`, `visible`, `hidden`, `enabled`, or `disabled` state. Semantic ambiguity follows the same strict rules as actions. |
 | `handle-dialog --tab=ID --action=accept|dismiss` | Resolve an open JavaScript alert, confirm, or prompt. | The action sent to Chrome. Add `--prompt-text=TEXT` when accepting a prompt. |
 
-Inspect before acting, use the most stable available selector, and verify the resulting state after any side effect.
+Prefer role and accessible name over CSS. Semantic resolution and the action share one debugger attachment, so a React rerender cannot make an intermediate `locate` result stale. For click postconditions, use `--wait-role`, `--wait-name`, `--wait-text`, `--wait-state`, and the matching exact/nth/within options.
 
 ## Network and console
 

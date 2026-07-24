@@ -23,10 +23,33 @@ const networkPresentation = {
   errorsOnly: arg("boolean", "Return only failed requests or HTTP status 400 and above.", { default: false }),
 };
 const selector = { selector: arg("string", "CSS selector scoped to the current document.") };
+const semanticTarget = {
+  role: arg("string", "Match an accessibility role."),
+  name: arg("string", "Match an accessible name."),
+  text: arg("string", "Match accessible text, value, or description."),
+  exact: arg("boolean", "Require an exact case-insensitive name/text match.", { default: false }),
+  nth: arg("integer", "Select this zero-based match; omitted means ambiguous matches fail."),
+  within: arg("string", "Limit semantic matching to this CSS subtree."),
+};
+const semanticTypeTarget = {
+  role: semanticTarget.role,
+  name: semanticTarget.name,
+  targetText: arg("string", "Match accessible text, value, or description."),
+  exact: semanticTarget.exact,
+  nth: semanticTarget.nth,
+  within: semanticTarget.within,
+};
 const wait = {
   wait: arg("enum", "Wait for page load completion.", { enum: ["load"] }),
   waitForUrl: arg("string", "Wait until the tab URL contains this value."),
   waitForSelector: arg("string", "Wait until this CSS selector exists."),
+  waitRole: arg("string", "Wait for an accessibility role."),
+  waitName: arg("string", "Wait for an accessible name."),
+  waitText: arg("string", "Wait for accessible text, value, or description."),
+  waitState: arg("enum", "Required semantic state.", { enum: ["attached", "visible", "hidden", "enabled", "disabled"], default: "attached" }),
+  waitExact: arg("boolean", "Require an exact semantic wait match.", { default: false }),
+  waitNth: arg("integer", "Select this zero-based semantic wait match."),
+  waitWithin: arg("string", "Limit the semantic wait to this CSS subtree."),
   waitTimeout: arg("duration", "Maximum action wait.", { default: "30s" }),
 };
 
@@ -172,7 +195,7 @@ export const COMMANDS = [
     examples: ["chrome-bridge snapshot diff --before=/tmp/before.json --after=/tmp/after.json", "chrome-bridge snapshot diff --before=/tmp/before.json --after=/tmp/after.json --max-results=100"],
   }),
   command(["locate"], "Find semantic elements and suggest stable selectors.", {
-    debuggerAttachment: "temporary", arguments: { ...tab, text: arg("string", "Match accessible text."), role: arg("string", "Match accessibility role."), name: arg("string", "Match accessible name.") },
+    debuggerAttachment: "temporary", arguments: { ...tab, ...semanticTarget },
     requirements: ["text, role, or name"], output: "{matches:Array<{backendNodeId,role,name,selector,visible,enabled,selectorStable,generated}>}",
     examples: ["chrome-bridge locate --tab=123 --text='Save changes'", "chrome-bridge locate --tab=123 --role=button --name=Post --max-results=20"],
   }),
@@ -203,7 +226,7 @@ export const COMMANDS = [
     examples: ["chrome-bridge styles --tab=123 --selector='main'", "chrome-bridge styles --tab=123 --selector='.card' --file=/tmp/styles.json"],
   }),
   command(["screenshot"], "Capture a page or element image.", {
-    debuggerAttachment: "temporary", arguments: { ...tab, ...selector, format: arg("enum", "Image format.", { enum: ["png", "jpeg"], default: "png" }), quality: arg("integer", "JPEG quality from 1 to 100.", { default: 85 }), fullPage: arg("boolean", "Capture beyond the viewport.", { default: true }) },
+    debuggerAttachment: "temporary", arguments: { ...tab, ...selector, ...semanticTarget, format: arg("enum", "Image format.", { enum: ["png", "jpeg"], default: "png" }), quality: arg("integer", "JPEG quality from 1 to 100.", { default: 85 }), fullPage: arg("boolean", "Capture beyond the viewport.", { default: true }) },
     output: "{data,format,tabId}; --file writes image bytes.", examples: ["chrome-bridge screenshot --tab=123 --file=/tmp/page.png", "chrome-bridge screenshot --tab=123 --selector=main --format=jpeg --quality=80 --file=/tmp/main.jpg"],
   }),
   command(["screencast"], "Capture rendered frames for a fixed duration.", {
@@ -214,23 +237,34 @@ export const COMMANDS = [
     syntax: "chrome-bridge eval --tab=ID [--value-only] JAVASCRIPT", debuggerAttachment: "temporary", arguments: { ...tab, expression: arg("string", "JavaScript expression.", { required: true }), evalTimeout: arg("duration", "Page-side evaluation timeout.", { default: "5s" }), valueOnly: arg("boolean", "Return only the serializable value.", { default: false }) }, requirements: ["expression"],
     output: "CDP RemoteObject, or its value with --value-only.", examples: ["chrome-bridge eval --tab=123 'document.title' --value-only", "chrome-bridge eval --tab=123 --eval-timeout=10s 'fetch(`/api`).then(r=>r.json())'"],
   }),
+  command(["extract"], "Extract repeated page records into bounded JSON.", {
+    debuggerAttachment: "temporary", arguments: {
+      ...tab,
+      item: arg("string", "CSS selector for each result item.", { required: true }),
+      within: arg("string", "CSS selector containing the result items."),
+      schema: arg("json-object", "Field map using selector, property, attribute, and closest.", { required: true }),
+      limit: arg("integer", "Maximum records returned.", { default: 100 }),
+    },
+    requirements: ["item", "schema"], output: "{items,total,returned,limited,url}",
+    examples: ["chrome-bridge extract --tab=123 --item=article --schema='{\"text\":{\"property\":\"innerText\"}}'", "chrome-bridge extract --tab=123 --within=main --item=a --schema='{\"text\":{\"property\":\"innerText\"},\"url\":{\"property\":\"href\"}}'"],
+  }),
 
   command(["click"], "Click a selector, accessibility backend node, or viewport point and report the final tab state.", {
-    changesPageState: true, debuggerAttachment: "temporary", arguments: { ...tab, ...selector, backendNodeId: arg("integer", "backendDOMNodeId from snapshot."), x: arg("number", "Viewport X coordinate."), y: arg("number", "Viewport Y coordinate."), double: arg("boolean", "Double click.", { default: false }), ...wait },
-    requirements: ["one of selector, backendNodeId, or both x and y"], output: "{outcome,dispatchCompleted,sideEffectMayHaveOccurred,beforeUrl,lastKnownUrl,title,recommendedAction?,x,y,clickCount}",
-    examples: ["chrome-bridge click --tab=123 --backend-node-id=456 --wait-for-url=/analytics", "chrome-bridge click --tab=123 --selector='button' --wait-for-selector=main"],
+    changesPageState: true, debuggerAttachment: "temporary", arguments: { ...tab, ...selector, ...semanticTarget, backendNodeId: arg("integer", "backendDOMNodeId from snapshot."), x: arg("number", "Viewport X coordinate."), y: arg("number", "Viewport Y coordinate."), double: arg("boolean", "Double click.", { default: false }), ...wait },
+    requirements: ["one of selector, backendNodeId, role/name/text, or both x and y"], output: "{outcome,dispatchCompleted,sideEffectMayHaveOccurred,beforeUrl,lastKnownUrl,title,target,recommendedAction?,x,y,clickCount}",
+    examples: ["chrome-bridge click --tab=123 --role=button --name='Save changes' --wait-role=status --wait-name=Saved", "chrome-bridge click --tab=123 --backend-node-id=456 --wait-for-url=/analytics"],
   }),
   command(["hover"], "Move the mouse over a selector or viewport point.", {
-    changesPageState: true, debuggerAttachment: "temporary", arguments: { ...tab, ...selector, x: arg("number", "Viewport X coordinate."), y: arg("number", "Viewport Y coordinate.") }, requirements: ["selector or both x and y"], output: "{x,y,tag?,text?}",
-    examples: ["chrome-bridge hover --tab=123 --selector='button'", "chrome-bridge hover --tab=123 --x=100 --y=200"],
+    changesPageState: true, debuggerAttachment: "temporary", arguments: { ...tab, ...selector, ...semanticTarget, x: arg("number", "Viewport X coordinate."), y: arg("number", "Viewport Y coordinate.") }, requirements: ["selector, role/name/text, or both x and y"], output: "{x,y,tag?,text?,target?}",
+    examples: ["chrome-bridge hover --tab=123 --role=button --name=Account", "chrome-bridge hover --tab=123 --x=100 --y=200"],
   }),
   command(["drag"], "Drag between selectors or coordinate pairs.", {
     changesPageState: true, debuggerAttachment: "temporary", arguments: { ...tab, fromSelector: arg("string", "Source CSS selector."), toSelector: arg("string", "Destination CSS selector."), fromX: arg("number", "Source X."), fromY: arg("number", "Source Y."), toX: arg("number", "Destination X."), toY: arg("number", "Destination Y.") }, requirements: ["source and destination selectors or coordinate pairs"], output: "{from,to}",
     examples: ["chrome-bridge drag --tab=123 --from-selector='#a' --to-selector='#b'", "chrome-bridge drag --tab=123 --from-x=10 --from-y=10 --to-x=200 --to-y=200"],
   }),
   command(["type"], "Replace text in a selected editable element.", {
-    changesPageState: true, debuggerAttachment: "temporary", arguments: { ...tab, selector: arg("string", "Editable element selector.", { required: true }), text: arg("string", "Text to insert.", { required: true }) }, requirements: ["selector", "text"], output: "{tag,length}",
-    examples: ["chrome-bridge type --tab=123 --selector='input[name=q]' --text='query'", "chrome-bridge type --tab=123 --selector=textarea --text='draft'"],
+    changesPageState: true, debuggerAttachment: "temporary", arguments: { ...tab, selector: arg("string", "Editable element selector."), ...semanticTypeTarget, text: arg("string", "Text to insert.", { required: true }) }, requirements: ["selector or role/name/targetText", "text"], output: "{tag,length,target?}",
+    examples: ["chrome-bridge type --tab=123 --role=textbox --name=Search --text='query'", "chrome-bridge type --tab=123 --selector=textarea --text='draft'"],
   }),
   command(["type-text"], "Insert text into the currently focused element.", {
     syntax: "chrome-bridge type-text --tab=ID TEXT", changesPageState: true, debuggerAttachment: "temporary", arguments: { ...tab, text: arg("string", "Text to insert.", { required: true }) }, requirements: ["text"], output: "{length}",
@@ -241,16 +275,16 @@ export const COMMANDS = [
     examples: ["chrome-bridge press-key --tab=123 Enter", "chrome-bridge press-key --tab=123 Meta+A"],
   }),
   command(["fill-form"], "Fill several form controls from a JSON array.", {
-    changesPageState: true, debuggerAttachment: "temporary", arguments: { ...tab, elements: arg("json-array", "Array of {selector,value}.", { required: true }) }, requirements: ["elements"], output: "Array<{selector,tag}>",
-    examples: ["chrome-bridge fill-form --tab=123 --elements='[{\"selector\":\"#q\",\"value\":\"hello\"}]'", "chrome-bridge fill-form --tab=123 --elements='[{\"selector\":\"#enabled\",\"value\":true}]'"],
+    changesPageState: true, debuggerAttachment: "temporary", arguments: { ...tab, elements: arg("json-array", "Array of {selector|role/name/text,value,exact?,nth?,within?}.", { required: true }) }, requirements: ["elements"], output: "Array<{selector?,tag,target?}>",
+    examples: ["chrome-bridge fill-form --tab=123 --elements='[{\"role\":\"textbox\",\"name\":\"Search\",\"value\":\"hello\"}]'", "chrome-bridge fill-form --tab=123 --elements='[{\"selector\":\"#enabled\",\"value\":true}]'"],
   }),
   command(["upload-file"], "Set local files on a file input.", {
-    changesPageState: true, debuggerAttachment: "temporary", arguments: { ...tab, selector: arg("string", "File-input selector.", { required: true }), file: arg("path", "One input file path."), files: arg("json-array", "Several input file paths."), out: COMMON_ARGUMENTS.out }, requirements: ["selector", "file or files"], output: "{selector,files}; use --out for a result receipt.",
-    examples: ["chrome-bridge upload-file --tab=123 --selector='input[type=file]' --file=/tmp/photo.png", "chrome-bridge upload-file --tab=123 --selector='#files' --files='[\"/tmp/a.txt\",\"/tmp/b.txt\"]' --out=/tmp/result.json"],
+    changesPageState: true, debuggerAttachment: "temporary", arguments: { ...tab, selector: arg("string", "File-input selector."), ...semanticTarget, file: arg("path", "One input file path."), files: arg("json-array", "Several input file paths."), out: COMMON_ARGUMENTS.out }, requirements: ["selector or role/name/text", "file or files"], output: "{selector?,target?,files}; use --out for a result receipt.",
+    examples: ["chrome-bridge upload-file --tab=123 --role=button --name='Upload photo' --file=/tmp/photo.png", "chrome-bridge upload-file --tab=123 --selector='#files' --files='[\"/tmp/a.txt\",\"/tmp/b.txt\"]' --out=/tmp/result.json"],
   }),
-  command(["wait-for"], "Wait for a selector, text, or truthy JavaScript expression.", {
-    syntax: "chrome-bridge wait-for --tab=ID (--selector=CSS|--text=TEXT|--expression=JS)", debuggerAttachment: "temporary", arguments: { ...tab, ...selector, text: arg("string", "Visible text fragment."), expression: arg("string", "Truthy JavaScript expression."), ...thirtySecondDuration }, requirements: ["selector, text, or expression"], output: "{matched:true,elapsedMs}",
-    examples: ["chrome-bridge wait-for --tab=123 --selector=main --duration=30s", "chrome-bridge wait-for --tab=123 --expression='document.readyState===\"complete\"'"],
+  command(["wait-for"], "Wait for a selector, page text, semantic target, or truthy JavaScript expression.", {
+    syntax: "chrome-bridge wait-for --tab=ID (--selector=CSS|--text=TEXT|--role=ROLE|--name=NAME|--expression=JS)", debuggerAttachment: "temporary", arguments: { ...tab, ...selector, text: arg("string", "Visible page text fragment."), role: semanticTarget.role, name: semanticTarget.name, targetText: arg("string", "Accessible text, value, or description."), exact: semanticTarget.exact, nth: semanticTarget.nth, within: semanticTarget.within, state: arg("enum", "Required semantic state.", { enum: ["attached", "visible", "hidden", "enabled", "disabled"], default: "attached" }), expression: arg("string", "Truthy JavaScript expression."), ...thirtySecondDuration }, requirements: ["selector, text, role, name, targetText, or expression"], output: "{matched:true,elapsedMs,target?}",
+    examples: ["chrome-bridge wait-for --tab=123 --role=button --name=Publish --state=enabled", "chrome-bridge wait-for --tab=123 --expression='document.readyState===\"complete\"'"],
   }),
   command(["handle-dialog"], "Accept or dismiss an open JavaScript dialog.", {
     changesPageState: true, debuggerAttachment: "temporary", arguments: { ...tab, action: arg("enum", "Dialog action.", { enum: ["accept", "dismiss"], default: "accept" }), promptText: arg("string", "Prompt response text.") }, output: "{action}",
@@ -422,14 +456,17 @@ export function coerceAndValidate(entry, params, parseDuration) {
   if (entry.requiresExplicitTab && entry.arguments.tab && result.tab === undefined && result.target === undefined && result.bridgeSession === undefined) {
     throw new Error(`${entry.name} requires an explicit --tab=ID because it can change browser state.\nExample: ${entry.examples[0]}`);
   }
-  if (entry.id === "click" && !(result.selector || result.backendNodeId !== undefined || (Number.isFinite(result.x) && Number.isFinite(result.y)))) {
-    throw new Error(`click requires a target. Use --selector, --backend-node-id, or --x and --y.\nExample: chrome-bridge click --tab=123 --selector='button'`);
+  const semantic = result.role || result.name || result.targetText || (result.text && !["type", "wait-for"].includes(entry.id));
+  if (entry.id === "click" && !(result.selector || result.backendNodeId !== undefined || semantic || (Number.isFinite(result.x) && Number.isFinite(result.y)))) {
+    throw new Error(`click requires a target. Use --role/--name/--text, --selector, --backend-node-id, or --x and --y.\nExample: chrome-bridge click --tab=123 --role=button --name=Save`);
   }
-  if (entry.id === "hover" && !(result.selector || (Number.isFinite(result.x) && Number.isFinite(result.y)))) throw new Error(`hover requires --selector or --x and --y. Use: ${entry.syntax}`);
+  if (entry.id === "hover" && !(result.selector || semantic || (Number.isFinite(result.x) && Number.isFinite(result.y)))) throw new Error(`hover requires a semantic target, --selector, or --x and --y. Use: ${entry.syntax}`);
   if (entry.id === "drag" && !(result.fromSelector || [result.fromX, result.fromY].every(Number.isFinite))) throw new Error(`drag requires --from-selector or --from-x and --from-y. Use: ${entry.syntax}`);
   if (entry.id === "drag" && !(result.toSelector || [result.toX, result.toY].every(Number.isFinite))) throw new Error(`drag requires --to-selector or --to-x and --to-y. Use: ${entry.syntax}`);
+  if (entry.id === "type" && !(result.selector || result.role || result.name || result.targetText)) throw new Error(`type requires --selector or a semantic target. Use: ${entry.syntax}`);
+  if (entry.id === "upload-file" && !(result.selector || semantic)) throw new Error(`upload-file requires --selector or a semantic target. Use: ${entry.syntax}`);
   if (entry.id === "upload-file" && result.file === undefined && result.files === undefined) throw new Error(`upload-file requires --file or --files. Use: ${entry.syntax}`);
-  if (entry.id === "wait-for" && !result.selector && !result.text && !result.expression) throw new Error(`wait-for requires --selector, --text, or --expression. Use: ${entry.syntax}`);
+  if (entry.id === "wait-for" && !result.selector && !result.text && !result.role && !result.name && !result.targetText && !result.expression) throw new Error(`wait-for requires a selector, text, semantic target, or expression. Use: ${entry.syntax}`);
   if (entry.id === "locate" && !result.text && !result.role && !result.name) throw new Error(`locate requires --text, --role, or --name. Use: ${entry.syntax}`);
   if (entry.id === "watch" && [result.urlChanges, result.selector, result.request, result.console].filter(Boolean).length !== 1) throw new Error(`watch requires exactly one of --url-changes, --selector, --request, or --console. Use: ${entry.syntax}`);
   if (entry.id === "cdp-send" && !result.method && !(result.domain && result.command)) throw new Error(`cdp send requires --method or --domain and --command. Use: ${entry.syntax}`);
